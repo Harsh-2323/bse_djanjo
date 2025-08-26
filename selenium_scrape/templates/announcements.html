@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Selenium Announcements Dashboard</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background: #f9f9f9;
+    }
+    h1 {
+      text-align: center;
+    }
+    .actions {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    button {
+      padding: 10px 16px;
+      background: #007bff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:disabled {
+      background: gray;
+      cursor: not-allowed;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    th {
+      background: #f0f0f0;
+    }
+    tr:hover {
+      background: #f5f5f5;
+    }
+    .log-box {
+      background: black;
+      color: #00ff00;
+      font-family: monospace;
+      padding: 10px;
+      margin-top: 20px;
+      border-radius: 6px;
+      max-height: 250px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>📢 Selenium Announcements</h1>
+  
+  <div class="actions">
+    <div><strong>Total Announcements:</strong> <span id="count">0</span></div>
+    <button id="scrapeBtn">🔄 Run Scraper</button>
+  </div>
+
+  <table id="announcementsTable">
+    <thead>
+      <tr>
+        <th>Company</th>
+        <th>Code</th>
+        <th>Announcement</th>
+        <th>Disseminated</th>
+        <th>PDF</th>
+      </tr>
+    </thead>
+    <tbody>
+      <!-- Filled by JS -->
+    </tbody>
+  </table>
+
+  <div id="logSection" style="display:none;">
+    <h2>📝 Scraper Log</h2>
+    <div class="log-box" id="logBox"></div>
+  </div>
+
+  <script>
+    async function fetchAnnouncements() {
+      const res = await fetch("/api/selenium-announcements/");
+      const data = await res.json();
+      const tbody = document.querySelector("#announcementsTable tbody");
+      tbody.innerHTML = "";
+      data.forEach(a => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${a.company_name || ""}</td>
+          <td>${a.company_code || ""}</td>
+          <td>${a.announcement_text || ""}</td>
+          <td>${a.exchange_disseminated_date || ""} ${a.exchange_disseminated_time || ""}</td>
+          <td>${a.pdf_link_web ? `<a href="${a.pdf_link_web}" target="_blank">Open PDF</a>` : ""}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+      document.getElementById("count").innerText = data.length;
+    }
+
+    async function runScraper() {
+      const btn = document.getElementById("scrapeBtn");
+      btn.disabled = true;
+      btn.innerText = "Scraping...";
+      const res = await fetch("/api/selenium-announcements/run_scraper/", {
+        method: "POST"
+      });
+      const data = await res.json();
+      document.getElementById("logSection").style.display = "block";
+      document.getElementById("logBox").innerText = data.log_tail || "No logs";
+      btn.disabled = false;
+      btn.innerText = "🔄 Run Scraper";
+      fetchAnnouncements(); // refresh table
+    }
+
+    document.getElementById("scrapeBtn").addEventListener("click", runScraper);
+
+    // load initial data
+    fetchAnnouncements();
+  </script>
+</body>
+</html>

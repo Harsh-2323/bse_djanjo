@@ -1,0 +1,33 @@
+# Python-specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Sensitive files
+.env
+*.env
+
+# Temporary/output directories
+downloads/
+outputs/
+pdfs/
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# IDE-specific
+.vscode/
+.idea/
+
+# Database files
+*.sqlite3
+*.db
+
+# Temporary files
+*~
+*.swp
+*.swo
+~$*
