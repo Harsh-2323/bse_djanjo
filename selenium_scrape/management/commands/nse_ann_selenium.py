@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Scrape NSE Corporate Filings (Announcements) and save to Excel (no DB).
+Scrape NSE Corporate Filings (Announcements) and save to **Database** (no Excel).
 
-Fixed version that prevents "Time Taken" from appearing in Subject column.
-Now also captures XBRL links and writes them to a separate Excel column.
-
-Usage:
-  python manage.py nse_ann_selenium --max-rows 80 --debug
+- Cleans Subject (strips "Time Taken" etc.)
+- Captures PDF + XBRL links into separate columns
+- Parses XBRL (works with /api/xbrl/{id} JSON, ZIPs, XML/XBRL)
+- Shares Selenium cookies with requests so API calls behave like the browser
 """
-import os, re, time
+
+import os, re, time, io, zipfile, json
 from urllib.parse import urljoin
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+import xml.etree.ElementTree as ET
 
 # Selenium
 from selenium import webdriver
@@ -28,6 +31,12 @@ try:
 except Exception:
     ChromeDriverManager = None
 
+# --- Model import (support either app layout) ---
+try:
+    # if both models live in selenium_scrape.models
+    from selenium_scrape.models import NseAnnouncement  # type: ignore
+except Exception:
+    from nse_scrape.models import NseAnnouncement  # type: ignore
 
 URL = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
 HOMEPAGE = "https://www.nseindia.com"
@@ -38,8 +47,13 @@ TIME_RE = r"\d{2}:\d{2}:\d{2}"
 BROADCAST_LABEL_RE = re.compile(r"(Exchange\s*Received\s*Time|Exchange\s*Dissemination\s*Time|Time\s*Taken)", re.I)
 TIME_TAKEN_BLOCK_RE = re.compile(r"Time\s*Taken[:\s]*" + TIME_RE, re.I)
 
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
-# ---------- helpers ----------
+# ---------- selenium & session helpers ----------
 def _setup_driver(headless: bool):
     opts = Options()
     if headless:
@@ -49,11 +63,7 @@ def _setup_driver(headless: bool):
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--window-size=1400,1000")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    )
+    opts.add_argument(f"user-agent={UA}")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.page_load_strategy = "normal"
@@ -63,6 +73,26 @@ def _setup_driver(headless: bool):
     else:
         service = Service(os.environ.get("CHROMEDRIVER", "chromedriver"))
     return webdriver.Chrome(service=service, options=opts)
+
+
+def _session_from_driver(driver) -> requests.Session:
+    """Clone NSE cookies from Selenium into a requests.Session."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+    for c in driver.get_cookies():
+        dom = c.get("domain") or "www.nseindia.com"
+        if "nseindia.com" not in dom:
+            continue
+        s.cookies.set(
+            c.get("name"), c.get("value", ""),
+            domain=dom, path=c.get("path", "/")
+        )
+    return s
 
 
 def _wait_table(driver, timeout=30):
@@ -92,6 +122,7 @@ def _load_enough_rows(driver, max_rows: int, pause: float, stall_tolerance: int)
             prev = new_count
 
 
+# ---------- table parsing helpers ----------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
@@ -117,18 +148,12 @@ def _has_pdf_link(td) -> bool:
 
 
 def _has_xbrl_link(td) -> bool:
-    """
-    Treat .xml/.xbrl as XBRL; also pick zipped XBRL packages and links containing 'xbrl'.
-    """
     if not td:
         return False
-    sel = td.select_one(
-        'a[href*=".xml" i], a[href*=".xbrl" i], a[href*=".zip" i], a[href*="xbrl" i]'
-    )
+    sel = td.select_one('a[href*=".xml" i], a[href*=".xbrl" i], a[href*=".zip" i], a[href*="xbrl" i]')
     if not sel:
         return False
     href = (sel.get("href") or "").lower()
-    # keep generic zip only if it looks like xbrl-ish
     return (".xml" in href or ".xbrl" in href or "xbrl" in href or href.endswith(".zip"))
 
 
@@ -156,15 +181,12 @@ def _looks_like_company(s: str) -> bool:
 
 
 def _is_broadcast_text(s: str) -> bool:
-    """Identify any broadcast-ish cell."""
     if not s:
         return False
     if BROADCAST_LABEL_RE.search(s):
         return True
-    # has explicit 'Time Taken hh:mm:ss'?
     if TIME_TAKEN_BLOCK_RE.search(s):
         return True
-    # or contains at least two full datetimes
     return len(re.findall(DT_RE, s)) >= 2
 
 
@@ -193,49 +215,28 @@ def _parse_broadcast_text(s: str):
     return res
 
 
-# 🔒 Enhanced broadcast bit stripper - more aggressive patterns
 def _strip_broadcast_bits(s: str) -> str:
     if not s:
         return s
-
-    # Remove complete broadcast patterns
     s2 = re.sub(r"Exchange\s*Received\s*Time.*?(?=Exchange|Time\s*Taken|$)", "", s, flags=re.I | re.DOTALL).strip()
     s2 = re.sub(r"Exchange\s*Dissemination\s*Time.*?(?=Exchange|Time\s*Taken|$)", "", s2, flags=re.I | re.DOTALL).strip()
     s2 = re.sub(r"Time\s*Taken[:\s]*" + TIME_RE + r".*?$", "", s2, flags=re.I | re.DOTALL).strip()
-
-    # Remove any standalone time patterns (HH:MM:SS)
     s2 = re.sub(r"\s+" + TIME_RE + r"(?:\s|$)", " ", s2, flags=re.I).strip()
-
-    # Remove any remaining broadcast keywords with following content
     s2 = re.sub(r"(?:Exchange|Time\s*Taken).*?$", "", s2, flags=re.I).strip()
-
     return s2
 
 
 def _clean_subject(s: str) -> str:
     if not s:
         return s
-
-    # First pass - remove broadcast segments
     s2 = _strip_broadcast_bits(s)
-
-    # Remove trailing datetimes
     s2 = re.sub(r"\s+" + DT_RE + r"\s*$", "", s2).strip()
-
-    # Remove any remaining time patterns at the end
     s2 = re.sub(r"\s+" + TIME_RE + r"\s*$", "", s2).strip()
-
-    # Final cleanup - remove any text that looks like broadcast labels
     s2 = re.sub(r"(?:Exchange\s*(?:Received|Dissemination)\s*Time|Time\s*Taken).*?$", "", s2, flags=re.I).strip()
-
-    # Reject if what remains is just placeholder text
     if s2.strip().lower() in {"data", "details", "time", "taken", "exchange"}:
         return ""
-
-    # Reject if it's just numbers and colons (likely a time)
     if re.fullmatch(r"[\d:\s]+", s2.strip()):
         return ""
-
     return s2
 
 
@@ -252,11 +253,8 @@ def _pick_subject_candidate(texts, banned_idx):
             continue
         if _is_broadcast_text(t):
             continue
-
-        # Additional check: skip if text contains time patterns
-        if re.search(TIME_RE, t) and len(t.strip()) < 50:  # Short text with time pattern is likely broadcast
+        if re.search(TIME_RE, t) and len(t.strip()) < 50:
             continue
-
         tt = _clean_subject(t)
         if not tt:
             continue
@@ -265,8 +263,166 @@ def _pick_subject_candidate(texts, banned_idx):
     return best_idx, best_val
 
 
+# ---------- XBRL utils ----------
+def _iter_localname(e):
+    """Yield (localname, element) for all descendants including root."""
+    stack = [e]
+    while stack:
+        cur = stack.pop()
+        local = cur.tag.split('}', 1)[-1] if '}' in cur.tag else cur.tag
+        yield local, cur
+        stack.extend(list(cur))
+
+
+def _find_first_text(root, names):
+    for lname, el in _iter_localname(root):
+        if lname in names:
+            t = (el.text or "").strip()
+            if t:
+                return t
+    return ""
+
+
+def _choose_zip_member(namelist):
+    """Pick the most likely XBRL instance file inside a zip."""
+    candidates = [n for n in namelist if n.lower().endswith((".xml", ".xbrl"))]
+    if not candidates:
+        return None
+    pri = sorted(
+        candidates,
+        key=lambda n: (
+            0 if "inst" in n.lower() or "instance" in n.lower() else 1,
+            0 if "capmkt" in n.lower() else 1,
+            len(n)
+        )
+    )
+    return pri[0]
+
+
+def _parse_xbrl_bytes(xml_bytes, debug=False):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        return None, f"parse_error: {e}"
+
+    data = {
+        "XBRL NSE Symbol": _find_first_text(root, {"NSESymbol", "Symbol"}),
+        "XBRL Company Name": _find_first_text(root, {"NameOfTheCompany", "CompanyName", "NameOfCompany"}),
+        "XBRL Subject": _find_first_text(root, {"SubjectOfAnnouncement", "Subject"}),
+        "XBRL Description": _find_first_text(root, {"DescriptionOfAnnouncement", "Description"}),
+        "XBRL Attachment URL": _find_first_text(root, {"AttachmentURL", "AttachmentUrl", "AttachmentLink", "PdfURL", "PDFURL"}),
+        "XBRL DateTime": _find_first_text(root, {"DateAndTimeOfSubmission", "DateOfSubmission", "DateTime"}),
+        "XBRL Category": _find_first_text(root, {"CategoryOfAnnouncement", "Category"}),
+    }
+    for k in list(data.keys()):
+        data[k] = (data[k] or "").strip()
+    ok = any(data.values())
+    return (data if ok else None), ("ok" if ok else "empty_xbrl")
+
+
+def _find_urls_in_json(obj):
+    """Yield all strings in a JSON that look like URLs (pref xbrl/xml/zip)."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str):
+            s = cur.strip()
+            if s.startswith("http"):
+                yield s
+
+
+def _prefer_xbrl_url(urls):
+    """Pick best candidate pointing to actual instance file."""
+    pri = sorted(
+        urls,
+        key=lambda u: (
+            0 if re.search(r"\.(xbrl|xml)(?:$|\?)", u.lower()) else 1,
+            0 if "xbrl" in u.lower() else 1,
+            0 if u.lower().endswith(".zip") else 2,
+            len(u)
+        )
+    )
+    return pri[0] if pri else None
+
+
+def _extract_fields_from_json(j):
+    """Best-effort field pull when the API returns decoded XBRL as JSON."""
+    flat = {}
+    stack = [(None, j)]
+    while stack:
+        k, v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.items())
+        elif isinstance(v, list):
+            stack.extend([(k, x) for x in v])
+        else:
+            key = (k or "").lower()
+            if isinstance(v, str):
+                if "symbol" in key and "nse" in key: flat["XBRL NSE Symbol"] = v
+                elif "company" in key and "name" in key: flat["XBRL Company Name"] = v
+                elif "subject" in key: flat["XBRL Subject"] = v
+                elif "description" in key: flat["XBRL Description"] = v
+                elif "attachment" in key and ("url" in key or "link" in key): flat["XBRL Attachment URL"] = v
+                elif "datetime" in key or ("date" in key and "time" in key): flat["XBRL DateTime"] = v
+                elif "category" in key: flat["XBRL Category"] = v
+    return {k: v for k, v in flat.items() if v}
+
+
+def _fetch_and_parse_xbrl(url, session: requests.Session, debug=False):
+    """Fetch URL that may be an API JSON, a ZIP, or an XML/XBRL, then parse."""
+    try:
+        r = session.get(url, timeout=30, allow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:
+        return None, f"http_error: {e}"
+
+    ct = (r.headers.get("Content-Type") or "").lower()
+    body = r.content or b""
+
+    # CASE A: JSON wrapper like /api/xbrl/{id}
+    is_jsonish = "json" in ct or (body[:1] in (b"{", b"["))
+    if is_jsonish:
+        try:
+            j = r.json()
+        except Exception:
+            try:
+                j = json.loads(body.decode("utf-8", "ignore"))
+            except Exception as e:
+                return None, f"json_error: {e}"
+
+        urls = list(_find_urls_in_json(j))
+        cand = _prefer_xbrl_url(urls)
+        if cand:
+            return _fetch_and_parse_xbrl(urljoin(URL, cand), session, debug=debug)
+
+        data = _extract_fields_from_json(j)
+        if data:
+            return data, "ok_json"
+
+        return None, "json_no_urls"
+
+    # CASE B: ZIP package
+    if url.lower().endswith(".zip") or "zip" in ct:
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as zf:
+                member = _choose_zip_member(zf.namelist())
+                if not member:
+                    return None, "zip_no_xml"
+                xml_bytes = zf.read(member)
+        except Exception as e:
+            return None, f"zip_error: {e}"
+        return _parse_xbrl_bytes(xml_bytes, debug=debug)
+
+    # CASE C: XML/XBRL inline
+    return _parse_xbrl_bytes(body, debug=debug)
+
+
 # ---------- extraction ----------
-def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFrame:
+def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bool=True, http_sess: requests.Session | None=None) -> pd.DataFrame:
     soup = BeautifulSoup(driver.page_source, "lxml")
     colmap = _build_header_map(soup)
     if debug:
@@ -274,6 +430,10 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
 
     rows = soup.select("#CFanncEquityTable tbody tr")
     out = []
+
+    # HTTP session (shared cookies)
+    sess = http_sess or requests.Session()
+    sess.headers.update({"User-Agent": UA, "Referer": URL})
 
     for r in rows[:max_rows]:
         tds = r.find_all("td")
@@ -317,19 +477,11 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
         else:
             subj_text = _clean_subject(texts[idx_subject])
 
-        # final values (with enhanced safety)
         symbol = texts[idx_symbol] if _in_range(idx_symbol, tds) and _looks_like_symbol(texts[idx_symbol]) else ""
         company_name = texts[idx_company] if _in_range(idx_company, tds) and _looks_like_company(texts[idx_company]) else ""
 
-        # Enhanced subject cleaning with multiple passes
         subject = _clean_subject(subj_text or "")
-        subject = _strip_broadcast_bits(subject)  # Double-check
-
-        # Final validation: if subject still contains broadcast-like content, clear it
-        if subject and (_is_broadcast_text(subject) or re.search(r"Time\s*Taken", subject, re.I)):
-            if debug:
-                print(f"WARNING: Clearing subject with broadcast content: {subject}")
-            subject = ""
+        subject = _strip_broadcast_bits(subject)
 
         # broadcast split
         rec = dis = taken = ""
@@ -350,7 +502,6 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
             return urls
 
         if _in_range(idx_attach, tds):
-            # parse only the attachment cell
             for u in _scan_td_for_links(tds[idx_attach]):
                 lu = u.lower()
                 if ".pdf" in lu:
@@ -358,7 +509,6 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
                 elif any(x in lu for x in [".xml", ".xbrl", "xbrl", ".zip"]):
                     xbrl_links.append(u)
         else:
-            # fallback: scan all tds
             for td in tds:
                 for u in _scan_td_for_links(td):
                     lu = u.lower()
@@ -367,10 +517,9 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
                     elif any(x in lu for x in [".xml", ".xbrl", "xbrl", ".zip"]):
                         xbrl_links.append(u)
 
-        # de-dup while keeping order
+        # de-dup keep order
         def _dedup(seq):
-            seen = set()
-            outl = []
+            seen, outl = set(), []
             for x in seq:
                 if x not in seen:
                     seen.add(x)
@@ -380,87 +529,63 @@ def _extract_table_html(driver, max_rows: int, debug: bool = False) -> pd.DataFr
         pdf_links = _dedup(pdf_links)
         xbrl_links = _dedup(xbrl_links)
 
-        # Optional size text shown in attachment cell (keep as-is for PDF column)
-        size_text = None
-        if _in_range(idx_attach, tds):
-            size_text = re.sub(r"\s*PDF\s*", "", texts[idx_attach], flags=re.I).strip() or None
-
-        out.append({
+        row = {
             "Symbol": symbol,
             "Company Name": company_name,
             "Subject": subject,
             "Exchange Received Time": rec,
             "Exchange Dissemination Time": dis,
             "Time Taken": taken,
-            "Attachment Size": size_text,                  # PDF size-ish text if present
-            "Attachment Link": " | ".join(pdf_links) if pdf_links else "",   # PDF(s)
-            "XBRL Link": " | ".join(xbrl_links) if xbrl_links else "",       # XBRL(s)
+            "Attachment Size": re.sub(r"\s*PDF\s*", "", texts[idx_attach], flags=re.I).strip() if _in_range(idx_attach, tds) else None,
+            "Attachment Link": " | ".join(pdf_links) if pdf_links else "",
+            "XBRL Link": " | ".join(xbrl_links) if xbrl_links else "",
             "Has XBRL": bool(xbrl_links),
-        })
+
+            # parsed XBRL fields (filled later if available)
+            "XBRL NSE Symbol": "",
+            "XBRL Company Name": "",
+            "XBRL Subject": "",
+            "XBRL Description": "",
+            "XBRL Attachment URL": "",
+            "XBRL DateTime": "",
+            "XBRL Category": "",
+            "XBRL Parse Status": "no_xbrl" if not xbrl_links else "skipped" if not xbrl_parse else "",
+        }
+
+        if xbrl_parse and xbrl_links:
+            primary = xbrl_links[0]
+            data, status = _fetch_and_parse_xbrl(primary, sess, debug=debug)
+            row["XBRL Parse Status"] = status
+            if data:
+                row.update({k: v for k, v in data.items() if v})
+                if not row["Subject"] and data.get("XBRL Subject"):
+                    row["Subject"] = data["XBRL Subject"]
+
+        out.append(row)
 
     return pd.DataFrame(out)
 
 
-def _save_excel(df: pd.DataFrame, out_path: str):
-    parent = os.path.dirname(out_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Announcements")
-        ws = writer.sheets["Announcements"]
-
-        # make clickable hyperlinks for single-link cells
-        if "Attachment Link" in df.columns:
-            link_col = df.columns.get_loc("Attachment Link")
-            for r, val in enumerate(df["Attachment Link"]):
-                if isinstance(val, str) and val.startswith("http") and " | " not in val:
-                    ws.write_url(r + 1, link_col, val, string="Open PDF")
-
-        if "XBRL Link" in df.columns:
-            xcol = df.columns.get_loc("XBRL Link")
-            for r, val in enumerate(df["XBRL Link"]):
-                if isinstance(val, str) and val.startswith("http") and " | " not in val:
-                    ws.write_url(r + 1, xcol, val, string="Open XBRL")
-
-        # tidy column widths
-        def _set_if(col_idx, width):
-            try:
-                ws.set_column(col_idx, col_idx, width)
-            except Exception:
-                pass
-
-        header_idx = {name: i for i, name in enumerate(df.columns)}
-        _set_if(header_idx.get("Symbol", 0), 16)
-        _set_if(header_idx.get("Company Name", 1), 40)
-        _set_if(header_idx.get("Subject", 2), 60)
-        _set_if(header_idx.get("Exchange Received Time", 3), 22)
-        _set_if(header_idx.get("Exchange Dissemination Time", 4), 24)
-        _set_if(header_idx.get("Time Taken", 5), 12)
-        _set_if(header_idx.get("Attachment Size", 6), 14)
-        _set_if(header_idx.get("Attachment Link", 7), 50)
-        _set_if(header_idx.get("XBRL Link", 8), 50)
-        _set_if(header_idx.get("Has XBRL", 9), 10)
-
-
 # ---------- command ----------
 class Command(BaseCommand):
-    help = "Scrape NSE announcements and save to Excel (clean Company & Subject; split times; include XBRL)."
+    help = "Scrape NSE announcements → Database (cleans Subject; splits times; includes & parses XBRL)."
 
     def add_arguments(self, parser):
         parser.add_argument("--max-rows", type=int, default=100)
         parser.add_argument("--headless", action="store_true", default=False)
         parser.add_argument("--pause", type=float, default=1.2)
         parser.add_argument("--stall", type=int, default=4)
-        parser.add_argument("--xlsx", type=str, default="outputs/NSE_Announcements.xlsx")
         parser.add_argument("--debug", action="store_true")
+        parser.add_argument("--xbrl-parse", dest="xbrl_parse", action="store_true", default=True)
+        parser.add_argument("--no-xbrl-parse", dest="xbrl_parse", action="store_false")
 
     def handle(self, *args, **opts):
-        max_rows = int(opts["max_rows"])
-        headless = bool(opts["headless"])
-        pause = float(opts["pause"])
-        stall = int(opts["stall"])
-        xlsx = (opts.get("xlsx") or "outputs/NSE_Announcements.xlsx").strip()
-        debug = bool(opts.get("debug"))
+        max_rows  = int(opts["max_rows"])
+        headless  = bool(opts["headless"])
+        pause     = float(opts["pause"])
+        stall     = int(opts["stall"])
+        debug     = bool(opts.get("debug"))
+        xbrl_parse = bool(opts.get("xbrl_parse"))
 
         self.stdout.write(f"→ Launching Chrome (headless={headless})")
         driver = None
@@ -469,6 +594,7 @@ class Command(BaseCommand):
         except Exception as e:
             raise CommandError(f"Failed to launch Chrome/Driver: {e}")
 
+        df = pd.DataFrame()
         try:
             self.stdout.write("→ Opening NSE homepage (cookie preflight)")
             driver.get(HOMEPAGE)
@@ -476,10 +602,13 @@ class Command(BaseCommand):
 
             self.stdout.write("→ Opening announcements page")
             driver.get(URL)
-
             _wait_table(driver, 30)
+
+            # build HTTP session with current NSE cookies
+            sess = _session_from_driver(driver)
+
             _load_enough_rows(driver, max_rows=max_rows, pause=pause, stall_tolerance=stall)
-            df = _extract_table_html(driver, max_rows=max_rows, debug=debug)
+            df = _extract_table_html(driver, max_rows=max_rows, debug=debug, xbrl_parse=xbrl_parse, http_sess=sess)
 
         finally:
             if driver:
@@ -488,6 +617,57 @@ class Command(BaseCommand):
                 except Exception:
                     pass
 
-        self.stdout.write(f"→ Saving Excel to {xlsx}")
-        _save_excel(df, xlsx)
-        self.stdout.write(self.style.SUCCESS(f"Saved {len(df)} rows to {xlsx}"))
+        if df.empty:
+            self.stdout.write(self.style.WARNING("❌ No announcements scraped"))
+            return
+
+        # ------------------------------
+        # Save to Database
+        # ------------------------------
+        def _none_if_blank(v):
+            if v is None:
+                return None
+            if isinstance(v, float) and pd.isna(v):
+                return None
+            if isinstance(v, str) and not v.strip():
+                return None
+            return v
+
+        count_new, count_existing = 0, 0
+        for _, row in df.iterrows():
+            unique_key = {
+                "symbol": _none_if_blank(row.get("Symbol")),
+                "subject": _none_if_blank(row.get("Subject")),
+                "exchange_dissemination_time": _none_if_blank(row.get("Exchange Dissemination Time")),
+            }
+            defaults = {
+                "company_name": _none_if_blank(row.get("Company Name")),
+                "exchange_received_time": _none_if_blank(row.get("Exchange Received Time")),
+                "time_taken": _none_if_blank(row.get("Time Taken")),
+                "attachment_size": _none_if_blank(row.get("Attachment Size")),
+                "attachment_link": _none_if_blank(row.get("Attachment Link")),
+                "xbrl_link": _none_if_blank(row.get("XBRL Link")),
+                "has_xbrl": bool(row.get("Has XBRL")),
+                "xbrl_nse_symbol": _none_if_blank(row.get("XBRL NSE Symbol")),
+                "xbrl_company_name": _none_if_blank(row.get("XBRL Company Name")),
+                "xbrl_subject": _none_if_blank(row.get("XBRL Subject")),
+                "xbrl_description": _none_if_blank(row.get("XBRL Description")),
+                "xbrl_attachment_url": _none_if_blank(row.get("XBRL Attachment URL")),
+                "xbrl_datetime": _none_if_blank(row.get("XBRL DateTime")),
+                "xbrl_category": _none_if_blank(row.get("XBRL Category")),
+                "xbrl_parse_status": _none_if_blank(row.get("XBRL Parse Status")),
+            }
+
+            with transaction.atomic():
+                obj, created = NseAnnouncement.objects.update_or_create(
+                    **unique_key,
+                    defaults=defaults
+                )
+            if created:
+                count_new += 1
+            else:
+                count_existing += 1
+
+        self.stdout.write(self.style.SUCCESS(
+            f"✅ {count_new} new NSE records inserted, {count_existing} already existed"
+        ))
