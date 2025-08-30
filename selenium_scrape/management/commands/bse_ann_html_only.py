@@ -1,46 +1,42 @@
-import os
-import re
-import time
-from pathlib import Path
+from datetime import datetime
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from typing import List, Dict, Optional
-from urllib.parse import urljoin
-
-# --- Django bootstrap ---
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "bse_api.settings")
-import django
-django.setup()
-
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-
+from urllib.parse import urljoin
+from pathlib import Path
+import re
+import time
+import os
+import boto3
+from botocore.client import Config
 from django.core.management.base import BaseCommand
 from django.db import transaction
-
-from selenium_scrape.models import SeleniumAnnouncement
-
-# Selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium_scrape.models import SeleniumAnnouncement
 
-# ----------------------------------------------------
-# Config (defaults; can be overridden via CLI options)
-# ----------------------------------------------------
+# Constants
 BSE_URL = "https://www.bseindia.com/corporates/ann.html"
-
-DEFAULT_MAX_ENTRIES = 10
-DEFAULT_DOWNLOAD_PDFS = True
-DEFAULT_PDF_DIR = "pdfs"
 DEFAULT_OUTPUT_XLSX = "outputs/BSE_Announcements_Output.xlsx"
 
+# Cloudflare R2 Configuration (from environment variables)
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET")
+R2_PUBLIC_BASEURL = os.getenv("R2_PUBLIC_BASEURL")
+R2_BASE_PATH = "bse_announcements"
 
 # -----------------------------
 # Selenium setup
 # -----------------------------
-def setup_driver(headless: bool = True, download_dir: Optional[str] = None):
+def setup_driver(headless: bool = True):
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
@@ -58,15 +54,9 @@ def setup_driver(headless: bool = True, download_dir: Optional[str] = None):
         "profile.default_content_setting_values.notifications": 2,
         "plugins.always_open_pdf_externally": True,
     }
-    if download_dir:
-        prefs.update({
-            "download.default_directory": str(Path(download_dir).absolute()),
-            "download.prompt_for_download": False,
-        })
     opts.add_experimental_option("prefs", prefs)
 
     return webdriver.Chrome(options=opts)
-
 
 # -----------------------------
 # Helpers
@@ -76,9 +66,19 @@ def safe_filename(name: str, max_len: int = 150) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] or "announcement"
 
-
-def download_pdf(pdf_url: str, outfile_path: str, timeout: int = 30) -> bool:
+def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[str]:
+    """Fetch PDF from pdf_url and upload to Cloudflare R2, return the R2 public URL."""
     try:
+        # Initialize R2 client
+        s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            endpoint_url=R2_ENDPOINT_URL,
+            config=Config(signature_version="s3v4")
+        )
+
+        # Fetch PDF content
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": BSE_URL,
@@ -86,28 +86,30 @@ def download_pdf(pdf_url: str, outfile_path: str, timeout: int = 30) -> bool:
         }
         with requests.get(pdf_url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as r:
             if not r.ok:
-                return False
+                print(f"Failed to fetch PDF from {pdf_url}: Status {r.status_code}")
+                return None
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "pdf" not in ctype and not pdf_url.lower().endswith(".pdf"):
-                return False
+                print(f"Invalid content type for {pdf_url}: {ctype}")
+                return None
 
-            Path(outfile_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(outfile_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        return True
-    except Exception:
-        return False
+            # Upload to R2
+            s3_client.upload_fileobj(
+                Fileobj=r.raw,
+                Bucket=R2_BUCKET_NAME,
+                Key=r2_path,
+                ExtraArgs={"ContentType": "application/pdf"}
+            )
 
+            # Construct public URL
+            r2_url = f"{R2_PUBLIC_BASEURL}/{r2_path}"
+            print(f"Successfully uploaded {pdf_url} to {r2_url}")
+            return r2_url
+    except Exception as e:
+        print(f"Error uploading PDF to R2 for {pdf_url}: {e}")
+        return None
 
 def _extract_category_from_table(table) -> str:
-    """
-    Attempt to read the 'Category' shown on the right of the first row
-    of each announcement table (e.g., 'Company Update').
-    We take the last non-empty cell text of the first data row,
-    skipping file-size tokens and the literal 'XBRL'.
-    """
     try:
         rows = table.find_all("tr")
         if not rows:
@@ -117,7 +119,6 @@ def _extract_category_from_table(table) -> str:
             txt = (td.get_text(" ", strip=True) or "").strip()
             if not txt:
                 continue
-            # skip sizes like "0.67 MB" and the literal XBRL
             if re.search(r"\b\d+(\.\d+)?\s*(KB|MB)\b", txt, flags=re.I):
                 continue
             if txt.upper() == "XBRL":
@@ -127,114 +128,8 @@ def _extract_category_from_table(table) -> str:
         pass
     return ""
 
-
 # -----------------------------
-# Core scrape
-# -----------------------------
-def scrape_bse_announcements_like_reference(
-    max_entries: int,
-    download_pdfs: bool,
-    pdf_dir: str,
-    headless: bool = True,
-) -> pd.DataFrame:
-    driver = setup_driver(headless=headless, download_dir=pdf_dir if download_pdfs else None)
-    try:
-        driver.get(BSE_URL)
-
-        # Wait for the Angular tables to appear
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
-        )
-
-        # Keep scrolling until enough announcements are loaded
-        last_count = 0
-        for _ in range(20):  # max 20 scrolls safeguard
-            tables_now = driver.find_elements(By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']")
-            if len(tables_now) >= max_entries:
-                break
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
-            )
-            if len(tables_now) == last_count:
-                break
-            last_count = len(tables_now)
-
-        soup = BeautifulSoup(driver.page_source, "lxml")
-        tables = soup.find_all("table", {"ng-repeat": "cann in CorpannData.Table"})
-    finally:
-        driver.quit()
-
-    records: List[Dict] = []
-    for table in tables:
-        if len(records) >= max_entries:
-            break
-        try:
-            newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
-            headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
-            pdf_tag = table.find("a", class_="tablebluelink", href=True)
-
-            newssub = (newssub_tag.get_text(strip=True) if newssub_tag else "") or ""
-            headline = (headline_tag.get_text(strip=True) if headline_tag else "") or ""
-            category = _extract_category_from_table(table)  # <-- NEW
-            pdf_link = urljoin(BSE_URL, pdf_tag["href"]) if pdf_tag else ""
-
-            # second-last row carries the timestamps on BSE
-            all_rows = table.find_all("tr")
-            time_row_text = all_rows[-2].get_text(strip=True) if len(all_rows) >= 2 else ""
-
-            match_received = re.search(
-                r"Exchange Received Time\s*(\d{2}-\d{2}-\d{4})\s*(\d{2}:\d{2}:\d{2})",
-                time_row_text
-            )
-            match_disseminated = re.search(
-                r"Exchange Disseminated Time\s*(\d{2}-\d{2}-\d{4})\s*(\d{2}:\d{2}:\d{2})",
-                time_row_text
-            )
-
-            received_date = match_received.group(1) if match_received else ""
-            received_time = match_received.group(2) if match_received else ""
-            disseminated_date = match_disseminated.group(1) if match_disseminated else ""
-            disseminated_time = match_disseminated.group(2) if match_disseminated else ""
-
-            company_name = newssub.split("-")[0].strip() if newssub else ""
-            code_match = re.search(r"\b(\d{6})\b", newssub)
-            company_code = code_match.group(1) if code_match else ""
-
-            local_pdf_path = ""
-            if download_pdfs and pdf_link:
-                code_for_name = company_code or (re.search(r"\d{6}", newssub).group() if re.search(r"\d{6}", newssub) else "NA")
-                date_compact = received_date.replace("-", "") if received_date else "NA"
-                base = f"{len(records)+1:03d}{code_for_name}{date_compact}_{safe_filename(headline)}.pdf"
-                local_pdf_path = os.path.abspath(os.path.join(pdf_dir, base))
-                if not download_pdf(pdf_link, local_pdf_path):
-                    local_pdf_path = ""
-
-            records.append({
-                # NEW fields
-                "Headline": headline,
-                "Category": category,
-
-                # Existing fields
-                "Company Name": company_name,
-                "Company Code": company_code,
-                "Announcement Text": headline,  # keep legacy column the same
-                "Exchange Received Date": received_date,
-                "Exchange Received Time": received_time,
-                "Exchange Disseminated Date": disseminated_date,
-                "Exchange Disseminated Time": disseminated_time,
-                "PDF Link (web)": pdf_link,
-                "PDF Path (local)": local_pdf_path,
-            })
-        except Exception as e:
-            print(f"Error parsing entry {len(records)+1}: {e}")
-
-    return pd.DataFrame(records)
-
-
-# -----------------------------
-# Excel writer (with hyperlinks)
+# Excel writer
 # -----------------------------
 def save_to_excel_with_links(df: pd.DataFrame, out_path: str):
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -245,51 +140,165 @@ def save_to_excel_with_links(df: pd.DataFrame, out_path: str):
 
         cols = {name: idx for idx, name in enumerate(df.columns)}
         web_col = cols.get("PDF Link (web)")
-        local_col = cols.get("PDF Path (local)")
+        cloud_col = cols.get("PDF Path (cloud)")
+        r2_path_col = cols.get("PDF R2 Path")
 
         for r in range(len(df)):
-            # Web link
             if web_col is not None:
                 web = df.iat[r, web_col]
                 if isinstance(web, str) and web.startswith("http"):
                     ws.write_url(r + 1, web_col, web, string="Open PDF (web)")
+            if cloud_col is not None:
+                lp = df.iat[r, cloud_col]
+                if isinstance(lp, str) and lp.startswith("http"):
+                    ws.write_url(r + 1, cloud_col, lp, string="Open PDF (cloud)")
+            if r2_path_col is not None:
+                rp = df.iat[r, r2_path_col]
+                if isinstance(rp, str) and rp:
+                    ws.write_string(r + 1, r2_path_col, rp)
 
-            # Local file link
-            if local_col is not None:
-                lp = df.iat[r, local_col]
-                if isinstance(lp, str) and lp:
-                    ws.write_url(r + 1, local_col, f"external:{lp}", string="Open PDF (local)")
-
-        # Column widths
         def _setcol(c, w):
             if c is not None:
                 ws.set_column(c, c, w)
 
-        # give new columns sensible widths if present
         _setcol(cols.get("Headline"), 60)
         _setcol(cols.get("Category"), 28)
-
-        ws.set_column(0, 0, 28)   # Company Name
-        ws.set_column(1, 1, 12)   # Company Code
-        ws.set_column(2, 2, 60)   # Announcement Text
-        ws.set_column(3, 6, 20)   # Dates/Times
+        ws.set_column(0, 0, 28)  # Company Name
+        ws.set_column(1, 1, 12)  # Company Code
+        ws.set_column(2, 2, 60)  # Announcement Text
+        ws.set_column(3, 6, 20)  # Dates/Times
         _setcol(web_col, 22)
-        _setcol(local_col, 26)
+        _setcol(cloud_col, 26)
+        _setcol(r2_path_col, 26)
 
+# -----------------------------
+# Core scrape
+# -----------------------------
+def scrape_bse_announcements_like_reference(
+    target_date: str = "28-08-2025",
+    download_pdfs: bool = True,
+    headless: bool = True,
+) -> pd.DataFrame:
+    driver = setup_driver(headless=headless)
+    records: List[Dict] = []
+    try:
+        driver.get(BSE_URL)
+
+        # Wait for the Angular tables to appear
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
+        )
+
+        while True:
+            # Parse current page
+            soup = BeautifulSoup(driver.page_source, "lxml")
+            tables = soup.find_all("table", {"ng-repeat": "cann in CorpannData.Table"})
+
+            for table in tables:
+                try:
+                    newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
+                    headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
+                    pdf_tag = table.find("a", class_="tablebluelink", href=True)
+
+                    newssub = (newssub_tag.get_text(strip=True) if newssub_tag else "") or ""
+                    headline = (headline_tag.get_text(strip=True) if headline_tag else "") or ""
+                    category = _extract_category_from_table(table)
+                    pdf_link = urljoin(BSE_URL, pdf_tag["href"]) if pdf_tag else ""
+
+                    # Extract timestamps
+                    all_rows = table.find_all("tr")
+                    time_row_text = all_rows[-2].get_text(strip=True) if len(all_rows) >= 2 else ""
+                    match_received = re.search(
+                        r"Exchange Received Time\s*(\d{2}-\d{2}-\d{4})\s*(\d{2}:\d{2}:\d{2})",
+                        time_row_text
+                    )
+                    match_disseminated = re.search(
+                        r"Exchange Disseminated Time\s*(\d{2}-\d{2}-\d{4})\s*(\d{2}:\d{2}:\d{2})",
+                        time_row_text
+                    )
+
+                    received_date = match_received.group(1) if match_received else ""
+                    received_time = match_received.group(2) if match_received else ""
+                    disseminated_date = match_disseminated.group(1) if match_disseminated else ""
+                    disseminated_time = match_disseminated.group(2) if match_disseminated else ""
+
+                    # Only process announcements for the target date
+                    if disseminated_date != target_date:
+                        continue
+
+                    company_name = newssub.split("-")[0].strip() if newssub else ""
+                    code_match = re.search(r"\b(\d{6})\b", newssub)
+                    company_code = code_match.group(1) if code_match else ""
+
+                    # Check for duplicate before fetching/uploading PDF
+                    unique_key = {
+                        "company_code": company_code,
+                        "announcement_text": headline,
+                        "exchange_disseminated_date": disseminated_date,
+                        "exchange_disseminated_time": disseminated_time,
+                    }
+                    if SeleniumAnnouncement.objects.filter(**unique_key).exists():
+                        continue  # Skip duplicates to avoid fetching/uploading PDF
+
+                    pdf_path_cloud = ""
+                    pdf_r2_path = ""
+                    if download_pdfs and pdf_link:
+                        code_for_name = company_code or (re.search(r"\d{6}", newssub).group() if re.search(r"\d{6}", newssub) else "NA")
+                        date_compact = received_date.replace("-", "") if received_date else "NA"
+                        r2_filename = f"{len(records)+1:03d}{code_for_name}{date_compact}_{safe_filename(headline)[:50]}.pdf"
+                        pdf_r2_path = f"{R2_BASE_PATH}/{r2_filename}"
+                        pdf_path_cloud = upload_pdf_to_r2(pdf_link, pdf_r2_path)
+                        if not pdf_path_cloud:
+                            print(f"Failed to upload PDF for {headline}")
+
+                    records.append({
+                        "Headline": headline,
+                        "Category": category,
+                        "Company Name": company_name,
+                        "Company Code": company_code,
+                        "Announcement Text": headline,
+                        "Exchange Received Date": received_date,
+                        "Exchange Received Time": received_time,
+                        "Exchange Disseminated Date": disseminated_date,
+                        "Exchange Disseminated Time": disseminated_time,
+                        "PDF Link (web)": pdf_link,
+                        "PDF Path (cloud)": pdf_path_cloud,
+                        "PDF R2 Path": pdf_r2_path,
+                    })
+                except Exception as e:
+                    print(f"Error parsing entry {len(records)+1}: {e}")
+
+            # Check for and click the "Next" button
+            try:
+                next_button = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.ID, "idnext"))
+                )
+                ActionChains(driver).move_to_element(next_button).click().perform()
+                time.sleep(2)
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
+                )
+            except (TimeoutException, NoSuchElementException):
+                print("No more pages to scrape (Next button not found).")
+                break
+
+    finally:
+        driver.quit()
+
+    return pd.DataFrame(records)
 
 # -----------------------------
 # Django management command
 # -----------------------------
 class Command(BaseCommand):
-    help = "Scrape BSE Corporate Announcements and save into Postgres (deduplicated)"
+    help = "Scrape BSE Corporate Announcements for a specific date and save into Postgres (deduplicated)"
 
     def add_arguments(self, parser):
         parser.add_argument(
-            "--max-pages", "--max-entries",
-            dest="max_pages",
-            type=int,
-            default=1,
-            help="Number of announcements to scrape"
+            "--date",
+            type=str,
+            default="28-08-2025",
+            help="Target date for announcements (format: DD-MM-YYYY, e.g., 28-08-2025)",
         )
         parser.add_argument(
             "--debug",
@@ -298,22 +307,29 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        self.stdout.write("🚀 Starting Enhanced BSE Announcements Scraper...")
+        target_date = options["date"]
+        self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date}...")
+
+        # Validate date format
+        try:
+            datetime.strptime(target_date, "%d-%m-%Y")
+        except ValueError:
+            self.stdout.write(self.style.ERROR("❌ Invalid date format. Use DD-MM-YYYY (e.g., 28-08-2025)"))
+            return
 
         items = scrape_bse_announcements_like_reference(
-            max_entries=options["max_pages"],
+            target_date=target_date,
             download_pdfs=True,
-            pdf_dir=DEFAULT_PDF_DIR,
             headless=not options["debug"]
         )
 
         if items.empty:
-            self.stdout.write(self.style.WARNING("❌ No data scraped"))
+            self.stdout.write(self.style.WARNING("❌ No data scraped for the specified date"))
             return
 
         # Optional: quick sanity print
         try:
-            self.stdout.write("\nSample:\n" + items[["Headline","Category","Company Name"]].head(3).to_string(index=False))
+            self.stdout.write("\nSample:\n" + items[["Headline", "Category", "Company Name"]].head(3).to_string(index=False))
         except Exception:
             pass
 
@@ -327,31 +343,39 @@ class Command(BaseCommand):
                 "exchange_disseminated_time": row.get("Exchange Disseminated Time"),
             }
 
-            # Include new fields in defaults so they persist
-            defaults = {
-                "company_name": row.get("Company Name"),
-                "pdf_link_web": row.get("PDF Link (web)"),
-                "pdf_path_local": row.get("PDF Path (local)"),
-                "exchange_received_date": row.get("Exchange Received Date"),
-                "exchange_received_time": row.get("Exchange Received Time"),
-                # NEW:
-                "headline": row.get("Headline") or None,
-                "category": row.get("Category") or None,
-            }
-
-            with transaction.atomic():
-                obj, created = SeleniumAnnouncement.objects.update_or_create(
-                    **unique_key,
-                    defaults=defaults,
-                )
-
-            if created:
-                count_new += 1
-            else:
+            # Skip if record already exists
+            if SeleniumAnnouncement.objects.filter(**unique_key).exists():
                 count_existing += 1
+                continue
+
+            # Create new record
+            with transaction.atomic():
+                SeleniumAnnouncement.objects.create(
+                    company_name=row.get("Company Name"),
+                    company_code=row.get("Company Code"),
+                    headline=row.get("Headline") or None,
+                    category=row.get("Category") or None,
+                    announcement_text=row.get("Announcement Text"),
+                    exchange_received_date=row.get("Exchange Received Date"),
+                    exchange_received_time=row.get("Exchange Received Time"),
+                    exchange_disseminated_date=row.get("Exchange Disseminated Date"),
+                    exchange_disseminated_time=row.get("Exchange Disseminated Time"),
+                    pdf_link_web=row.get("PDF Link (web)"),
+                    pdf_path_cloud=row.get("PDF Path (cloud)"),
+                    pdf_r2_path=row.get("PDF R2 Path"),
+                )
+                count_new += 1
 
         self.stdout.write(
             self.style.SUCCESS(
                 f"✅ {count_new} new records inserted, {count_existing} already existed (skipped)"
             )
         )
+
+        # Save to Excel
+        if not items.empty:
+            output_path = f"outputs/BSE_Announcements_{target_date.replace('-', '')}.xlsx"
+            save_dir = Path(output_path).parent
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_to_excel_with_links(items, output_path)
+            self.stdout.write(self.style.SUCCESS(f"📊 Data saved to {output_path}"))

@@ -1,13 +1,16 @@
 from django.urls import path, include
-from django.shortcuts import redirect
 from rest_framework.routers import DefaultRouter
-from selenium_scrape.views import SeleniumAnnouncementViewSet, announcements_page
+from . import views
 
+# Create router and register both viewsets
 router = DefaultRouter()
-router.register("selenium-announcements", SeleniumAnnouncementViewSet, basename="selenium-announcements")
+router.register(r'selenium_announcements', views.SeleniumAnnouncementViewSet)
+router.register(r'bse_stock_quotes', views.BseStockQuoteViewSet)  # This line might be missing
 
 urlpatterns = [
-    path("", lambda request: redirect("announcements/")),  # redirect root to announcements
-    path("announcements/", announcements_page, name="announcements-page"),
-    path("api/", include(router.urls)),
+    # Page views
+    path('announcements/', views.announcements_page, name='announcements_page'),
+    
+    # API endpoints - include router URLs
+    path('', include(router.urls)),
 ]

@@ -2,129 +2,1101 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Selenium Announcements Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Quotes Dashboard</title>
   <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --primary: #667eea;
+      --primary-dark: #5a6fd8;
+      --secondary: #764ba2;
+      --accent: #f093fb;
+      --success: #10b981;
+      --error: #ef4444;
+      --warning: #f59e0b;
+      --dark: #1a1a2e;
+      --darker: #16213e;
+      --light: #ffffff;
+      --gray-100: #f7fafc;
+      --gray-200: #edf2f7;
+      --gray-300: #e2e8f0;
+      --gray-400: #cbd5e0;
+      --gray-500: #a0aec0;
+      --gray-600: #718096;
+      --gray-700: #4a5568;
+      --gray-800: #2d3748;
+      --text-primary: #2d3748;
+      --text-secondary: #718096;
+      --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+      --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+    }
+
     body {
-      font-family: Arial, sans-serif;
-      margin: 20px;
-      background: #f9f9f9;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      color: var(--text-primary);
+      overflow-x: hidden;
     }
-    h1 {
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .header {
       text-align: center;
+      margin-bottom: 40px;
+      animation: slideDown 0.8s ease-out;
     }
-    .actions {
+
+    .header h1 {
+      font-size: 3rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--light) 0%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 10px;
+      text-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    }
+
+    .header p {
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 1.1rem;
+      font-weight: 300;
+    }
+
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      gap: 30px;
+      margin-bottom: 30px;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(20px);
+      border-radius: 20px;
+      padding: 30px;
+      box-shadow: var(--shadow-xl);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      animation: slideUp 0.6s ease-out;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      transform: scaleX(0);
+      transition: transform 0.3s ease;
+    }
+
+    .card:hover::before {
+      transform: scaleX(1);
+    }
+
+    .card:hover {
+      transform: translateY(-8px);
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+    }
+
+    .stats-card {
+      grid-column: 1;
+    }
+
+    .controls-card {
+      grid-column: 2;
+    }
+
+    .card-header {
       display: flex;
-      justify-content: space-between;
-      margin-bottom: 20px;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 25px;
+      padding-bottom: 15px;
+      border-bottom: 2px solid var(--gray-200);
     }
-    button {
-      padding: 10px 16px;
-      background: #007bff;
+
+    .card-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
       color: white;
-      border: none;
-      border-radius: 4px;
+      box-shadow: var(--shadow-md);
+    }
+
+    .card-title {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: 20px;
+      background: linear-gradient(135deg, var(--gray-100), var(--gray-200));
+      border-radius: 16px;
+      transition: all 0.3s ease;
       cursor: pointer;
     }
-    button:disabled {
-      background: gray;
-      cursor: not-allowed;
+
+    .stat-item:hover {
+      transform: scale(1.05);
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      color: white;
     }
+
+    .stat-number {
+      font-size: 2.5rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      transition: all 0.3s ease;
+    }
+
+    .stat-item:hover .stat-number {
+      -webkit-text-fill-color: white;
+    }
+
+    .stat-label {
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      font-weight: 500;
+      transition: color 0.3s ease;
+    }
+
+    .stat-item:hover .stat-label {
+      color: rgba(255, 255, 255, 0.9);
+    }
+
+    .controls-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .control-group {
+      display: flex;
+      flex-direction: column;
+      gap: 15px;
+    }
+
+    .info-box {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+      border-radius: 12px;
+      padding: 16px;
+      color: var(--success);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .info-box strong {
+      color: var(--success);
+    }
+
+    .btn {
+      padding: 16px 24px;
+      border: none;
+      border-radius: 12px;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      text-decoration: none;
+      min-height: 56px;
+    }
+
+    .btn::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+      transition: left 0.5s;
+    }
+
+    .btn:hover::before {
+      left: 100%;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      color: white;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 25px 50px -12px rgba(102, 126, 234, 0.4);
+    }
+
+    .btn-primary:active {
+      transform: translateY(0);
+    }
+
+    .btn:disabled {
+      background: var(--gray-300);
+      color: var(--gray-600);
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn:disabled::before {
+      display: none;
+    }
+
+    .file-input-wrapper {
+      position: relative;
+      overflow: hidden;
+      display: inline-block;
+      width: 100%;
+    }
+
+    .file-input {
+      position: absolute;
+      left: -9999px;
+    }
+
+    .file-input-label {
+      padding: 16px 24px;
+      border: 2px dashed var(--primary);
+      border-radius: 12px;
+      background: rgba(102, 126, 234, 0.05);
+      color: var(--primary);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: block;
+      text-align: center;
+      font-weight: 600;
+      min-height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    .file-input-label:hover {
+      background: rgba(102, 126, 234, 0.1);
+      border-color: var(--primary-dark);
+      transform: translateY(-2px);
+    }
+
+    .status-message {
+      padding: 16px 20px;
+      border-radius: 12px;
+      margin: 20px 0;
+      font-weight: 500;
+      border-left: 4px solid;
+      animation: slideInLeft 0.5s ease-out;
+      backdrop-filter: blur(10px);
+    }
+
+    .status-message.success {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      border-color: var(--success);
+    }
+
+    .status-message.error {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--error);
+      border-color: var(--error);
+    }
+
+    .table-container {
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(20px);
+      border-radius: 20px;
+      overflow: hidden;
+      box-shadow: var(--shadow-xl);
+      margin-bottom: 30px;
+      animation: slideUp 0.8s ease-out;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .table-header {
+      padding: 25px 30px;
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      color: white;
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+
+    .table-header h2 {
+      font-size: 1.4rem;
+      font-weight: 600;
+    }
+
+    .table-wrapper {
+      overflow-x: auto;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
-      background: white;
     }
-    th, td {
-      border: 1px solid #ddd;
-      padding: 8px;
-      text-align: left;
-    }
+
     th {
-      background: #f0f0f0;
+      background: var(--gray-100);
+      padding: 16px 20px;
+      text-align: left;
+      font-weight: 600;
+      color: var(--text-primary);
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 2px solid var(--gray-200);
+      position: sticky;
+      top: 0;
+      z-index: 10;
     }
+
+    td {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--gray-200);
+      color: var(--text-primary);
+      transition: all 0.3s ease;
+    }
+
+    tr {
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+
     tr:hover {
-      background: #f5f5f5;
+      background: linear-gradient(135deg, rgba(102, 126, 234, 0.05), rgba(118, 75, 162, 0.05));
+      transform: scale(1.002);
     }
+
+    .loading-spinner {
+      width: 20px;
+      height: 20px;
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      border-radius: 50%;
+      border-top-color: white;
+      animation: spin 1s ease-in-out infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .log-section {
+      animation: slideUp 0.6s ease-out;
+    }
+
+    .log-container {
+      background: var(--dark);
+      border-radius: 16px;
+      padding: 25px;
+      box-shadow: var(--shadow-xl);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .log-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      color: var(--accent);
+    }
+
     .log-box {
-      background: black;
-      color: #00ff00;
-      font-family: monospace;
-      padding: 10px;
-      margin-top: 20px;
-      border-radius: 6px;
-      max-height: 250px;
+      background: rgba(0, 0, 0, 0.8);
+      color: #00ff88;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      padding: 20px;
+      border-radius: 12px;
+      max-height: 300px;
       overflow-y: auto;
       white-space: pre-wrap;
+      line-height: 1.5;
+      border: 1px solid rgba(0, 255, 136, 0.2);
+      position: relative;
+    }
+
+    .log-box::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, #00ff88, #00ffff);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    .pulse-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+      margin-right: 8px;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.1); }
+    }
+
+    @keyframes slideDown {
+      from {
+        opacity: 0;
+        transform: translateY(-30px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes slideUp {
+      from {
+        opacity: 0;
+        transform: translateY(30px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @keyframes slideInLeft {
+      from {
+        opacity: 0;
+        transform: translateX(-30px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    .fade-in {
+      animation: fadeIn 0.6s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 4px;
+      background: var(--gray-200);
+      border-radius: 2px;
+      overflow: hidden;
+      margin: 15px 0;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      width: 0%;
+      transition: width 0.3s ease;
+      position: relative;
+    }
+
+    .progress-fill::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      right: 0;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.6), transparent);
+      animation: shimmer 2s infinite;
+    }
+
+    @keyframes shimmer {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-secondary);
+    }
+
+    .empty-state-icon {
+      font-size: 4rem;
+      margin-bottom: 20px;
+      opacity: 0.5;
+    }
+
+    .badge {
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .badge-success {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .badge-error {
+      background: rgba(239, 68, 68, 0.1);
+      color: var(--error);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+    }
+
+    .badge-warning {
+      background: rgba(245, 158, 11, 0.1);
+      color: var(--warning);
+      border: 1px solid rgba(245, 158, 11, 0.2);
+    }
+
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      padding: 16px 24px;
+      background: white;
+      border-radius: 12px;
+      box-shadow: var(--shadow-xl);
+      border-left: 4px solid var(--success);
+      z-index: 1000;
+      transform: translateX(400px);
+      transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .toast.show {
+      transform: translateX(0);
+    }
+
+    .toast.error {
+      border-left-color: var(--error);
+    }
+
+    /* Responsive Design */
+    @media (max-width: 768px) {
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .header h1 {
+        font-size: 2rem;
+      }
+      
+      .card {
+        padding: 20px;
+      }
+      
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Custom Scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--gray-200);
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      border-radius: 4px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(135deg, var(--primary-dark), var(--accent));
+    }
+
+    .ripple-effect {
+      position: absolute;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.6);
+      transform: scale(0);
+      animation: ripple-animation 0.6s linear;
+      pointer-events: none;
+    }
+
+    @keyframes ripple-animation {
+      to {
+        transform: scale(4);
+        opacity: 0;
+      }
     }
   </style>
 </head>
 <body>
-  <h1>📢 Selenium Announcements</h1>
-  
-  <div class="actions">
-    <div><strong>Total Announcements:</strong> <span id="count">0</span></div>
-    <button id="scrapeBtn">🔄 Run Scraper</button>
-  </div>
+  <div class="container">
+    <header class="header">
+      <h1>Stock Quotes Dashboard</h1>
+      <p>Professional BSE stock quotes monitoring and analysis system</p>
+    </header>
 
-  <table id="announcementsTable">
-    <thead>
-      <tr>
-        <th>Company</th>
-        <th>Code</th>
-        <th>Announcement</th>
-        <th>Disseminated</th>
-        <th>PDF</th>
-      </tr>
-    </thead>
-    <tbody>
-      <!-- Filled by JS -->
-    </tbody>
-  </table>
+    <div class="dashboard-grid">
+      <div class="card stats-card">
+        <div class="card-header">
+          <div class="card-icon">📈</div>
+          <h2 class="card-title">Live Statistics</h2>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <div class="stat-number" id="quotesCount">0</div>
+            <div class="stat-label">Quotes Processed</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number" id="successRate">0%</div>
+            <div class="stat-label">Success Rate</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number" id="totalFiles">0</div>
+            <div class="stat-label">Files Processed</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-number" id="lastUpdate">Never</div>
+            <div class="stat-label">Last Updated</div>
+          </div>
+        </div>
+      </div>
 
-  <div id="logSection" style="display:none;">
-    <h2>📝 Scraper Log</h2>
-    <div class="log-box" id="logBox"></div>
+      <div class="card controls-card">
+        <div class="card-header">
+          <div class="card-icon">⚡</div>
+          <h2 class="card-title">Control Center</h2>
+        </div>
+        <div class="controls-grid">
+          <div class="info-box">
+            <strong>Excel File Requirements:</strong><br>
+            • File must contain a column named <strong>'CD_BSE Code'</strong><br>
+            • Each row should have a valid BSE company code<br>
+            • Supported formats: .xlsx, .xls
+          </div>
+          <div class="control-group">
+            <div class="file-input-wrapper">
+              <input type="file" id="excelFile" class="file-input" accept=".xlsx,.xls" />
+              <label for="excelFile" class="file-input-label">
+                📁 <span id="fileLabel">Choose Excel File with CD_BSE Code</span>
+              </label>
+            </div>
+            <button id="scrapeQuotesBtn" class="btn btn-primary ripple">
+              <span id="quotesIcon">📊</span>
+              <span id="quotesText">Scrape Stock Quotes</span>
+            </button>
+            <div class="progress-bar" id="quotesProgress" style="display: none;">
+              <div class="progress-fill" id="quotesProgressFill"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="quoteStatus" class="status-message" style="display:none;"></div>
+
+    <div id="quoteResults" style="display:none;">
+      <div class="table-container">
+        <div class="table-header">
+          <span>💹</span>
+          <h2>Stock Quotes Results</h2>
+          <div class="pulse-dot"></div>
+        </div>
+        <div class="table-wrapper">
+          <table id="quotesTable">
+            <thead>
+              <tr>
+                <th>BSE Code</th>
+                <th>Status</th>
+                <th>Message/Log</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="quotesData" style="display:none;">
+      <div class="table-container">
+        <div class="table-header">
+          <span>📈</span>
+          <h2>Stock Quotes Data</h2>
+          <div class="pulse-dot"></div>
+        </div>
+        <div class="table-wrapper">
+          <table id="quotesDataTable">
+            <thead>
+              <tr>
+                <th>BSE Code</th>
+                <th>Security Name</th>
+                <th>Industry</th>
+                <th>Scraped At</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="logSection" style="display:none;" class="log-section">
+      <div class="card">
+        <div class="log-container">
+          <div class="log-header">
+            <span>🔍</span>
+            <h2>Processing Activity Log</h2>
+            <div class="pulse-dot"></div>
+          </div>
+          <div class="log-box" id="logBox">Waiting for quote processing...</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
-    async function fetchAnnouncements() {
-      const res = await fetch("/api/selenium-announcements/");
-      const data = await res.json();
-      const tbody = document.querySelector("#announcementsTable tbody");
-      tbody.innerHTML = "";
-      data.forEach(a => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${a.company_name || ""}</td>
-          <td>${a.company_code || ""}</td>
-          <td>${a.announcement_text || ""}</td>
-          <td>${a.exchange_disseminated_date || ""} ${a.exchange_disseminated_time || ""}</td>
-          <td>${a.pdf_link_web ? `<a href="${a.pdf_link_web}" target="_blank">Open PDF</a>` : ""}</td>
-        `;
-        tbody.appendChild(tr);
-      });
-      document.getElementById("count").innerText = data.length;
+    let currentStats = {
+      quotes: 0,
+      successRate: 0,
+      totalFiles: 0,
+      lastUpdate: 'Never'
+    };
+
+    function animateNumber(element, start, end, duration = 1000) {
+      const startTime = Date.now();
+      const animate = () => {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        const easeOut = 1 - Math.pow(1 - progress, 3);
+        const current = Math.round(start + (end - start) * easeOut);
+        element.textContent = current;
+        
+        if (progress < 1) {
+          requestAnimationFrame(animate);
+        }
+      };
+      requestAnimationFrame(animate);
     }
 
-    async function runScraper() {
-      const btn = document.getElementById("scrapeBtn");
-      btn.disabled = true;
-      btn.innerText = "Scraping...";
-      const res = await fetch("/api/selenium-announcements/run_scraper/", {
-        method: "POST"
-      });
-      const data = await res.json();
+    function updateStats() {
+      animateNumber(document.getElementById('quotesCount'), 
+        parseInt(document.getElementById('quotesCount').textContent) || 0, 
+        currentStats.quotes);
+      document.getElementById('successRate').textContent = `${currentStats.successRate}%`;
+      document.getElementById('totalFiles').textContent = currentStats.totalFiles;
+      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+    }
+
+    function showToast(message, type = 'success') {
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      toast.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span>${type === 'success' ? '✅' : '❌'}</span>
+          <span>${message}</span>
+        </div>
+      `;
+      document.body.appendChild(toast);
+      
+      setTimeout(() => toast.classList.add('show'), 100);
+      setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => document.body.removeChild(toast), 500);
+      }, 3000);
+    }
+
+    function setButtonLoading(buttonId, iconId, textId, isLoading, loadingText) {
+      const button = document.getElementById(buttonId);
+      const icon = document.getElementById(iconId);
+      const text = document.getElementById(textId);
+      
+      button.disabled = isLoading;
+      
+      if (isLoading) {
+        icon.innerHTML = '<div class="loading-spinner"></div>';
+        text.textContent = loadingText;
+        button.style.background = 'linear-gradient(135deg, var(--gray-400), var(--gray-500))';
+      } else {
+        icon.innerHTML = '📊';
+        text.textContent = 'Scrape Stock Quotes';
+        button.style.background = 'linear-gradient(135deg, var(--primary), var(--secondary))';
+      }
+    }
+
+    function showProgress(progressId, fillId, show = true) {
+      const progress = document.getElementById(progressId);
+      const fill = document.getElementById(fillId);
+      
+      if (show) {
+        progress.style.display = 'block';
+        fill.style.width = '0%';
+        setTimeout(() => fill.style.width = '100%', 100);
+      } else {
+        progress.style.display = 'none';
+      }
+    }
+
+    async function fetchQuotesData() {
+      try {
+        const res = await fetch("/api/selenium_scrape/bse_stock_quotes/", {
+          headers: { 'Accept': 'application/json' }
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        const data = await res.json();
+        const tbody = document.querySelector("#quotesDataTable tbody");
+        tbody.innerHTML = "";
+        
+        if (data.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="4" class="empty-state">
+                <div class="empty-state-icon">📈</div>
+                <p>No stock quotes available. Upload an Excel file with CD_BSE Code column to start scraping.</p>
+              </td>
+            </tr>`;
+        } else {
+          data.forEach((q, index) => {
+            const tr = document.createElement("tr");
+            tr.style.animationDelay = `${index * 0.1}s`;
+            tr.className = 'fade-in';
+            tr.innerHTML = `
+              <td><strong>${q.scripcode || "N/A"}</strong></td>
+              <td>${q.security_name || "N/A"}</td>
+              <td>${q.basic_industry || "N/A"}</td>
+              <td>${q.scraped_at ? new Date(q.scraped_at).toLocaleString() : "N/A"}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+        document.getElementById("quotesData").style.display = "block";
+      } catch (error) {
+        console.error('Error fetching quotes data:', error);
+        showToast(`Failed to load stock quotes: ${error.message}`, 'error');
+      }
+    }
+
+    async function runQuotesScraper() {
+      const fileInput = document.getElementById("excelFile");
+      const statusDiv = document.getElementById("quoteStatus");
+      const resultsTable = document.querySelector("#quotesTable tbody");
+
+      if (!fileInput.files.length) {
+        statusDiv.innerText = "⚠️ Please select an Excel file with CD_BSE Code column before proceeding.";
+        statusDiv.className = "status-message error";
+        statusDiv.style.display = "block";
+        showToast("No file selected", "error");
+        return;
+      }
+
+      setButtonLoading('scrapeQuotesBtn', 'quotesIcon', 'quotesText', true, 'Processing BSE Codes...');
+      showProgress('quotesProgress', 'quotesProgressFill');
+      statusDiv.style.display = "none";
+      resultsTable.innerHTML = "";
       document.getElementById("logSection").style.display = "block";
-      document.getElementById("logBox").innerText = data.log_tail || "No logs";
-      btn.disabled = false;
-      btn.innerText = "🔄 Run Scraper";
-      fetchAnnouncements(); // refresh table
+      document.getElementById("logBox").innerText = "Initializing BSE quote processing...";
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+
+      try {
+        const res = await fetch("/api/selenium_scrape/bse_stock_quotes/scrape_quotes_from_excel/", {
+          method: "POST",
+          body: formData
+        });
+        
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        
+        const data = await res.json();
+
+        statusDiv.style.display = "block";
+        statusDiv.className = `status-message ${data.status === "completed" ? "success" : "error"}`;
+        statusDiv.innerHTML = `
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span>${data.status === "completed" ? "✅" : "❌"}</span>
+            <span>${data.message || "Processing completed."}</span>
+          </div>
+        `;
+
+        document.getElementById("logBox").innerText = data.results
+          .map(result => `BSE Code ${result.scripcode}: ${result.log_tail || result.message || "No log"}`)
+          .join("\n\n") || data.message || "BSE quote processing completed";
+
+        if (data.results && Array.isArray(data.results)) {
+          document.getElementById("quoteResults").style.display = "block";
+          data.results.forEach((result, index) => {
+            const tr = document.createElement("tr");
+            tr.style.animationDelay = `${index * 0.1}s`;
+            tr.className = 'fade-in';
+            const statusBadge = result.status === 'success' ? 'badge-success' : 
+                               result.status === 'error' ? 'badge-error' : 'badge-warning';
+            tr.innerHTML = `
+              <td><strong>${result.scripcode || "N/A"}</strong></td>
+              <td><span class="badge ${statusBadge}">${result.status || "Unknown"}</span></td>
+              <td>${result.message || result.log_tail || "No details available"}</td>
+            `;
+            resultsTable.appendChild(tr);
+          });
+
+          currentStats.quotes = data.results.length;
+          currentStats.totalFiles += 1;
+          const validResults = data.results.filter(r => r.status !== 'skipped');
+          currentStats.successRate = validResults.length ? 
+            Math.round((validResults.filter(r => r.status === 'success').length / validResults.length) * 100) : 0;
+
+          updateStats();
+          await fetchQuotesData(); // Refresh quotes table after scraping
+        }
+
+        showToast(data.status === "completed" ? 'BSE stock quotes processed successfully!' : 'Quote processing completed with issues');
+        fileInput.value = "";
+        document.getElementById('fileLabel').textContent = 'Choose Excel File with CD_BSE Code';
+      } catch (error) {
+        console.error('Error processing quotes:', error);
+        statusDiv.style.display = "block";
+        statusDiv.className = "status-message error";
+        statusDiv.innerHTML = `
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span>❌</span>
+            <span>Error: ${error.message}</span>
+          </div>
+        `;
+        document.getElementById("logBox").innerText = `Error: ${error.message}`;
+        showToast(`Quote processing failed: ${error.message}`, 'error');
+      } finally {
+        setButtonLoading('scrapeQuotesBtn', 'quotesIcon', 'quotesText', false);
+        setTimeout(() => showProgress('quotesProgress', 'quotesProgressFill', false), 500);
+      }
     }
 
-    document.getElementById("scrapeBtn").addEventListener("click", runScraper);
+    // File input change handler
+    document.getElementById('excelFile').addEventListener('change', function(e) {
+      const label = document.getElementById('fileLabel');
+      if (e.target.files.length > 0) {
+        label.textContent = `📄 ${e.target.files[0].name}`;
+        label.style.color = 'var(--success)';
+      } else {
+        label.textContent = 'Choose Excel File with CD_BSE Code';
+        label.style.color = 'var(--primary)';
+      }
+    });
 
-    // load initial data
-    fetchAnnouncements();
+    // Event listeners
+    document.getElementById("scrapeQuotesBtn").addEventListener("click", runQuotesScraper);
+
+    // Add ripple effect to buttons
+    document.querySelectorAll('.ripple').forEach(button => {
+      button.addEventListener('click', function(e) {
+        const ripple = document.createElement('span');
+        const rect = this.getBoundingClientRect();
+        const size = Math.max(rect.width, rect.height);
+        const x = e.clientX - rect.left - size / 2;
+        const y = e.clientY - rect.top - size / 2;
+        
+        ripple.style.width = ripple.style.height = size + 'px';
+        ripple.style.left = x + 'px';
+        ripple.style.top = y + 'px';
+        ripple.classList.add('ripple-effect');
+        
+        this.appendChild(ripple);
+        
+        setTimeout(() => {
+          ripple.remove();
+        }, 1000);
+      });
+    });
+
+    // Auto-refresh data periodically
+    setInterval(async () => {
+      if (currentStats.quotes > 0) {
+        await fetchQuotesData();
+        updateStats();
+      }
+    }, 30000);
+
+    // Load initial data
+    document.addEventListener('DOMContentLoaded', async () => {
+      await fetchQuotesData();
+      updateStats();
+    });
+
+    // Add dynamic title updates
+    function updateDocumentTitle() {
+      const count = currentStats.quotes;
+      document.title = count > 0 ? 
+        `(${count}) Stock Quotes Dashboard` : 
+        'Stock Quotes Dashboard';
+    }
+
+    // Observer for table updates
+    const observer = new MutationObserver(() => {
+      updateDocumentTitle();
+    });
+
+    observer.observe(document.querySelector('#quotesTable tbody'), {
+      childList: true,
+      subtree: true
+    });
+
+    // Add observer for quotes data table
+    const quotesDataObserver = new MutationObserver(() => {
+      updateDocumentTitle();
+    });
+
+    quotesDataObserver.observe(document.querySelector('#quotesDataTable tbody'), {
+      childList: true,
+      subtree: true
+    });
   </script>
 </body>
 </html>
