@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def announcements_page(request):
     """Render the stock quotes dashboard."""
-    return render(request, "announcements.html")
+    return render(request, "basic_industry.html")
 
 @contextmanager
 def managed_temp_file(suffix=".log", mode="w", encoding="utf-8"):

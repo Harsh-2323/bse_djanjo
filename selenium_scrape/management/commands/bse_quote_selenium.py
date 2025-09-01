@@ -29,11 +29,11 @@ if sys.platform.startswith('win'):
 
 BSE_STOCK_URL = "https://www.bseindia.com/stock-share-price/undefined/undefined/{scripcode}/"
 
-LABELS_TO_SCRAPE = ["Basic Industry", "Security Name"]
+LABELS_TO_SCRAPE = ["Basic Industry", "Security Name", "Company Name"]
 
 LABEL_ALIASES = {
     "Industry": "Basic Industry",
-    "Company Name": "Security Name",
+    "Company Name": "Company Name",
     "Name": "Security Name",
 }
 
@@ -171,18 +171,386 @@ class EnhancedBSEQuoteScraper:
             print(f"Failed to load {scripcode}: {str(e)}")
             raise
 
-    def _enhanced_find_security_name(self) -> Optional[str]:
+    def _enhanced_find_security_name(self) -> Dict[str, Optional[str]]:
+        company_name = None
+        security_name = None
+        
+        # ENHANCED COMPANY NAME EXTRACTION
+        
+        # Strategy 1: Enhanced H1 extraction with better cleaning
+        try:
+            wait = WebDriverWait(self.driver, ENHANCED_WAIT_TIME)
+            h1_element = wait.until(
+                EC.presence_of_element_located((By.XPATH, "//h1[@class='stockreach_title ng-binding']"))
+            )
+            
+            h1_text_methods = [
+                lambda: h1_element.text,
+                lambda: h1_element.get_attribute('textContent'),
+                lambda: h1_element.get_attribute('innerText'),
+                lambda: self.driver.execute_script("return arguments[0].textContent;", h1_element),
+                lambda: self.driver.execute_script("return arguments[0].innerText;", h1_element)
+            ]
+            
+            for method_idx, method in enumerate(h1_text_methods):
+                try:
+                    h1_text = clean_text(method())
+                    print(f"[H1-{method_idx + 1}] Raw text: '{h1_text}'")
+                    
+                    if h1_text and len(h1_text) > 2:
+                        # Clean up common prefixes and extract actual company name
+                        cleaned_h1 = h1_text
+                        
+                        # Remove common prefixes
+                        prefixes_to_remove = [
+                            r'^Industry Classification of\s+',
+                            r'^Stock Quote of\s+',
+                            r'^Share Price of\s+',
+                            r'^Quote of\s+',
+                            r'^BSE\s+',
+                            r'^Stock\s+',
+                            r'^Share\s+'
+                        ]
+                        
+                        for prefix in prefixes_to_remove:
+                            before_cleanup = cleaned_h1
+                            cleaned_h1 = re.sub(prefix, '', cleaned_h1, flags=re.IGNORECASE).strip()
+                            if before_cleanup != cleaned_h1:
+                                print(f"[H1-{method_idx + 1}] Removed prefix, now: '{cleaned_h1}'")
+                        
+                        # Extract company name from patterns like "ABB India Ltd(500002)"
+                        patterns = [
+                            r'^(.+?)\s*\(\s*\d+\s*\)$',  # "Company Name(scripcode)"
+                            r'^(.+?)\s*-\s*\d+$',        # "Company Name - scripcode"
+                            r'^(.+?)\s*\|\s*\d+$',       # "Company Name | scripcode"
+                            r'^(.+?)(?=\s*(?:\(|\-|\|)\s*\d)',  # Company name before scripcode
+                            r'^(.+)$'  # Fallback - use as is if no patterns match
+                        ]
+                        
+                        for pattern_idx, pattern in enumerate(patterns):
+                            match = re.search(pattern, cleaned_h1)
+                            if match:
+                                extracted_name = clean_text(match.group(1))
+                                print(f"[H1-{method_idx + 1}] Pattern {pattern_idx + 1} extracted: '{extracted_name}'")
+                                
+                                if (extracted_name and len(extracted_name) > 3 and 
+                                    not is_likely_navigation_text(extracted_name) and 
+                                    not is_price_or_percentage_text(extracted_name) and
+                                    not extracted_name.isdigit()):
+                                    company_name = extracted_name
+                                    print(f"*** COMPANY NAME FOUND (H1 Method {method_idx + 1}): '{company_name}' ***")
+                                    break
+                        
+                        if company_name:
+                            break
+                            
+                except Exception as method_err:
+                    print(f"[H1-{method_idx + 1}] Failed: {str(method_err)}")
+                    continue
+                    
+        except TimeoutException:
+            print("[H1] Element not found within timeout")
+        except Exception as e:
+            print(f"[H1] Search error: {str(e)}")
+
+        # Strategy 2: Enhanced page title extraction
+        if not company_name:
+            try:
+                print("[TITLE] Trying page title extraction...")
+                page_title = self.driver.title
+                if page_title:
+                    print(f"[TITLE] Page title: '{page_title}'")
+                    
+                    # Clean the title first
+                    cleaned_title = page_title
+                    
+                    # Remove common BSE suffixes
+                    suffixes_to_remove = [
+                        r'\s*-\s*BSE.*$',
+                        r'\s*\|\s*BSE.*$',
+                        r'\s*-\s*Stock.*$',
+                        r'\s*-\s*Share.*$',
+                        r'\s*-\s*Quote.*$',
+                        r'\s*-\s*Price.*$'
+                    ]
+                    
+                    for suffix in suffixes_to_remove:
+                        before_cleanup = cleaned_title
+                        cleaned_title = re.sub(suffix, '', cleaned_title, flags=re.IGNORECASE).strip()
+                        if before_cleanup != cleaned_title:
+                            print(f"[TITLE] After cleanup: '{cleaned_title}'")
+                    
+                    # Extract company name from patterns
+                    title_patterns = [
+                        r'^(.+?)\s*\(\s*\d+\s*\)$',  # "Company Name(scripcode)"
+                        r'^(.+?)\s*-\s*\d+$',        # "Company Name - scripcode"
+                        r'^(.+?)\s*\|\s*\d+$',       # "Company Name | scripcode"
+                        r'^(.+?)(?=\s*(?:\(|\-|\|)\s*\d)',  # Company name before scripcode
+                        r'^(.+)$'  # Use cleaned title as is
+                    ]
+                    
+                    for pattern_idx, pattern in enumerate(title_patterns):
+                        match = re.search(pattern, cleaned_title)
+                        if match:
+                            title_company_name = clean_text(match.group(1))
+                            print(f"[TITLE] Pattern {pattern_idx + 1} extracted: '{title_company_name}'")
+                            
+                            if (title_company_name and len(title_company_name) > 3 and
+                                not is_likely_navigation_text(title_company_name) and
+                                not is_price_or_percentage_text(title_company_name) and
+                                not title_company_name.isdigit()):
+                                company_name = title_company_name
+                                print(f"*** COMPANY NAME FOUND (Page Title): '{company_name}' ***")
+                                break
+                                
+            except Exception as e:
+                print(f"[TITLE] Extraction error: {str(e)}")
+
+        # Strategy 3: Look for specific company name elements
+        if not company_name:
+            try:
+                print("[ELEMENTS] Searching for dedicated company name elements...")
+                
+                company_selectors = [
+                    "//span[contains(@class, 'companyname')]",
+                    "//div[contains(@class, 'companyname')]",
+                    "//span[contains(@class, 'company-name')]",
+                    "//div[contains(@class, 'company-name')]",
+                    "//span[contains(@class, 'stockname')]",
+                    "//div[contains(@class, 'stockname')]",
+                    "//h2[contains(@class, 'ng-binding')]",
+                    "//h3[contains(@class, 'ng-binding')]",
+                    "//span[@class='ng-binding'][contains(text(), 'Ltd') or contains(text(), 'Limited') or contains(text(), 'Inc') or contains(text(), 'Corp')]"
+                ]
+                
+                for selector_idx, selector in enumerate(company_selectors):
+                    try:
+                        elements = self.driver.find_elements(By.XPATH, selector)
+                        print(f"[ELEMENTS] Selector {selector_idx + 1} found {len(elements)} elements")
+                        
+                        for idx, element in enumerate(elements):
+                            element_text = clean_text(element.text)
+                            if element_text:
+                                print(f"[ELEMENTS] Element {idx + 1}: '{element_text}'")
+                                
+                                # Clean and extract company name
+                                cleaned_text = element_text
+                                
+                                # Remove unwanted prefixes
+                                prefixes_to_remove = [
+                                    r'^Industry Classification of\s+',
+                                    r'^Stock Quote of\s+',
+                                    r'^Share Price of\s+',
+                                    r'^Quote of\s+',
+                                    r'^Price of\s+'
+                                ]
+                                
+                                for prefix in prefixes_to_remove:
+                                    before_cleanup = cleaned_text
+                                    cleaned_text = re.sub(prefix, '', cleaned_text, flags=re.IGNORECASE).strip()
+                                    if before_cleanup != cleaned_text:
+                                        print(f"[ELEMENTS] After prefix removal: '{cleaned_text}'")
+                                
+                                # Extract company name (remove scripcode in parentheses)
+                                patterns = [
+                                    r'^(.+?)\s*\(\s*\d+\s*\)$',  # "Company Name(scripcode)"
+                                    r'^(.+?)(?=\s*\(\s*\d+\s*\))',  # Company name before (scripcode)
+                                    r'^(.+)$'  # Use as is if no scripcode found
+                                ]
+                                
+                                for pattern_idx, pattern in enumerate(patterns):
+                                    match = re.search(pattern, cleaned_text)
+                                    if match:
+                                        extracted_name = clean_text(match.group(1))
+                                        print(f"[ELEMENTS] Pattern {pattern_idx + 1} extracted: '{extracted_name}'")
+                                        
+                                        if (extracted_name and len(extracted_name) > 3 and 
+                                            not is_likely_navigation_text(extracted_name) and 
+                                            not is_price_or_percentage_text(extracted_name) and
+                                            not extracted_name.isdigit() and
+                                            re.search(r'[a-zA-Z]{3,}', extracted_name)):
+                                            company_name = extracted_name
+                                            print(f"*** COMPANY NAME FOUND (Element Search): '{company_name}' ***")
+                                            break
+                                
+                                if company_name:
+                                    break
+                        
+                        if company_name:
+                            break
+                            
+                    except Exception as e:
+                        print(f"[ELEMENTS] Selector {selector_idx + 1} error: {str(e)}")
+                        continue
+                        
+            except Exception as e:
+                print(f"[ELEMENTS] Search error: {str(e)}")
+
+        # Strategy 4: Enhanced meta tag extraction
+        if not company_name:
+            try:
+                print("[META] Trying enhanced meta tag extraction...")
+                meta_queries = [
+                    ("og:title", "return document.querySelector('meta[property=\"og:title\"]')?.content || null;"),
+                    ("title", "return document.querySelector('meta[name=\"title\"]')?.content || null;"),
+                    ("description", "return document.querySelector('meta[name=\"description\"]')?.content || null;"),
+                    ("og:description", "return document.querySelector('meta[property=\"og:description\"]')?.content || null;")
+                ]
+                
+                for query_name, query in meta_queries:
+                    try:
+                        meta_content = self.driver.execute_script(query)
+                        if meta_content:
+                            print(f"[META-{query_name}] Content: '{meta_content}'")
+                            
+                            # Clean meta content
+                            cleaned_meta = meta_content
+                            
+                            # Remove BSE-specific prefixes and suffixes
+                            cleaners = [
+                                r'^.*?Industry Classification of\s+',
+                                r'^.*?Stock Quote of\s+',
+                                r'^.*?Share Price of\s+',
+                                r'\s*-\s*BSE.*$',
+                                r'\s*\|\s*BSE.*$',
+                                r'\s*-\s*Stock.*$',
+                                r'\s*-\s*Share.*$'
+                            ]
+                            
+                            for cleaner in cleaners:
+                                before_cleanup = cleaned_meta
+                                cleaned_meta = re.sub(cleaner, '', cleaned_meta, flags=re.IGNORECASE).strip()
+                                if before_cleanup != cleaned_meta:
+                                    print(f"[META-{query_name}] After cleanup: '{cleaned_meta}'")
+                            
+                            # Extract company name
+                            meta_patterns = [
+                                r'^(.+?)\s*\(\s*\d+\s*\)$',  # "Company Name(scripcode)"
+                                r'^(.+?)(?=\s*\(\s*\d+\s*\))',  # Company name before (scripcode)
+                                r'^(.+)$'  # Use cleaned content as is
+                            ]
+                            
+                            for pattern_idx, pattern in enumerate(meta_patterns):
+                                match = re.search(pattern, cleaned_meta)
+                                if match:
+                                    meta_company_name = clean_text(match.group(1))
+                                    print(f"[META-{query_name}] Pattern {pattern_idx + 1} extracted: '{meta_company_name}'")
+                                    
+                                    if (meta_company_name and len(meta_company_name) > 3 and
+                                        not is_likely_navigation_text(meta_company_name) and
+                                        not is_price_or_percentage_text(meta_company_name) and
+                                        re.search(r'[a-zA-Z]{3,}', meta_company_name)):
+                                        company_name = meta_company_name
+                                        print(f"*** COMPANY NAME FOUND (Meta Tag {query_name}): '{company_name}' ***")
+                                        break
+                            
+                            if company_name:
+                                break
+                                
+                    except Exception as e:
+                        print(f"[META-{query_name}] Error: {str(e)}")
+                        continue
+                        
+            except Exception as e:
+                print(f"[META] Extraction error: {str(e)}")
+
+        # Strategy 5: JavaScript-based company name search
+        if not company_name:
+            try:
+                print("[JS] Trying JavaScript-based company name extraction...")
+                js_company_search = """
+                        for (var j = 0; j < elements.length; j++) {
+                            var text = elements[j].textContent || elements[j].innerText || '';
+                            text = text.trim();
+                            
+                            if (text.length > 5 && text.length < 150) {
+                                // Remove common prefixes
+                                text = text.replace(/^Industry Classification of\\s+/i, '');
+                                text = text.replace(/^Stock Quote of\\s+/i, '');
+                                text = text.replace(/^Share Price of\\s+/i, '');
+                                
+                                // Extract company name (remove scripcode)
+                                var patterns = [
+                                    /^(.+?)\\s*\\(\\s*\\d+\\s*\\)$/,  // "Company Name(scripcode)"
+                                    /^(.+?)(?=\\s*\\(\\s*\\d+\\s*\\))/,  // Company name before (scripcode)
+                                    /^(.+)$/  // Use as is
+                                ];
+                                
+                                for (var p = 0; p < patterns.length; p++) {
+                                    var match = text.match(patterns[p]);
+                                    if (match && match[1]) {
+                                        var candidate = match[1].trim();
+                                        if (candidate.length > 3 && 
+                                            /[a-zA-Z]{3,}/.test(candidate) &&
+                                            !/(click|menu|home|login|search|button)/i.test(candidate) &&
+                                            !/^[\\d\\s\\-\\.%]+$/.test(candidate)) {
+                                            return candidate;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                }
+                return findCompanyName();
+                """
+                
+                js_company_result = self.driver.execute_script(js_company_search)
+                if js_company_result:
+                    js_company_name = clean_text(js_company_result)
+                    print(f"[JS] JavaScript found: '{js_company_name}'")
+                    
+                    if (js_company_name and len(js_company_name) > 3 and
+                        not is_likely_navigation_text(js_company_name) and
+                        not is_price_or_percentage_text(js_company_name)):
+                        company_name = js_company_name
+                        print(f"*** COMPANY NAME FOUND (JavaScript Search): '{company_name}' ***")
+                        
+            except Exception as e:
+                print(f"[JS] Search error: {str(e)}")
+
+        # Final validation and cleanup
+        if company_name:
+            # Final cleanup of the company name
+            original_name = company_name
+            company_name = company_name.strip()
+            
+            # Remove any remaining unwanted patterns
+            final_cleaners = [
+                r'\s*\(\s*\d+\s*\)$',  # Remove trailing (scripcode)
+                r'^Industry Classification of\s+',
+                r'^Stock Quote of\s+',
+                r'^Share Price of\s+'
+            ]
+            
+            for cleaner in final_cleaners:
+                before_final = company_name
+                company_name = re.sub(cleaner, '', company_name, flags=re.IGNORECASE).strip()
+                if before_final != company_name:
+                    print(f"[FINAL] Final cleanup: '{before_final}' -> '{company_name}'")
+            
+            print(f"*** FINAL COMPANY NAME: '{company_name}' ***")
+        else:
+            print("*** NO COMPANY NAME FOUND ***")
+
+        # SECURITY NAME EXTRACTION - UNCHANGED (since it's working)
         try:
             elements = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'ng-binding') and contains(text(), '|')]")
             for element in elements:
                 text = clean_text(element.text)
                 if text and '|' in text and not is_price_or_percentage_text(text) and not is_likely_navigation_text(text):
-                    company_name = extract_company_name(text)
-                    if company_name and len(company_name) > 3:
-                        return company_name
-        except Exception:
-            pass
-        return None
+                    security_name = extract_company_name(text)
+                    if security_name and len(security_name) > 3:
+                        print(f"*** SECURITY NAME FOUND: '{security_name}' ***")
+                        break
+        except Exception as e:
+            print(f"[SECURITY] Error finding security name: {str(e)}")
+
+        return {
+            "Company Name": company_name,
+            "Security Name": security_name
+        }
 
     def _enhanced_find_basic_industry(self) -> Optional[str]:
         print("Trying comprehensive table search...")
@@ -193,34 +561,28 @@ class EnhancedBSEQuoteScraper:
                 label_text = clean_text(cell.text)
                 print(f"Debug: Checking cell {idx}/{len(industry_cells)} - Label text: '{label_text}'")
                 try:
-                    # Get a dynamic XPath for the cell (for location debugging)
-                    try:
-                        cell_xpath = self.driver.execute_script(
-                            "function getXPath(element) {"
-                            "   if (element.id !== '') return 'id(\"' + element.id + '\")';"
-                            "   if (element === document.body) return '//' + element.tagName.toLowerCase();"
-                            "   var ix = 0;"
-                            "   var siblings = element.parentNode.childNodes;"
-                            "   for (var i = 0; i < siblings.length; i++) {"
-                            "       var sibling = siblings[i];"
-                            "       if (sibling === element) return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';"
-                            "       if (sibling.nodeType === 1 && sibling.tagName === element.tagName) ix++;"
-                            "   }"
-                            "};"
-                            "return getXPath(arguments[0]);",
-                            cell
-                        )
-                        print(f"Debug: Label cell location (XPath): {cell_xpath}")
-                    except Exception as xpath_err:
-                        print(f"Debug: Could not get XPath for label cell: {str(xpath_err)}")
+                    cell_xpath = self.driver.execute_script(
+                        "function getXPath(element) {"
+                        "   if (element.id !== '') return 'id(\"' + element.id + '\")';"
+                        "   if (element === document.body) return '//' + element.tagName.toLowerCase();"
+                        "   var ix = 0;"
+                        "   var siblings = element.parentNode.childNodes;"
+                        "   for (var i = 0; i < siblings.length; i++) {"
+                        "       var sibling = siblings[i];"
+                        "       if (sibling === element) return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';"
+                        "       if (sibling.nodeType === 1 && sibling.tagName === element.tagName) ix++;"
+                        "   }"
+                        "};"
+                        "return getXPath(arguments[0]);",
+                        cell
+                    )
+                    print(f"Debug: Label cell location (XPath): {cell_xpath}")
                     
-                    # Find next cell
                     next_cell = cell.find_element(By.XPATH, "./following-sibling::td[1]")
                     raw_text = next_cell.text
                     text = clean_text(raw_text)
                     print(f"Debug: Candidate value - Raw: '{raw_text}', Cleaned: '{text}'")
                     
-                    # Validation checks with reasons
                     if not text:
                         print("Debug: Rejected - Empty text")
                         continue
@@ -235,6 +597,7 @@ class EnhancedBSEQuoteScraper:
                         continue
                     
                     print("Debug: Accepted - Valid candidate found")
+                    print(f"*** BASIC INDUSTRY FOUND: '{text}' ***")
                     return text
                 except NoSuchElementException:
                     print(f"Debug: No next sibling td for cell {idx}")
@@ -247,13 +610,16 @@ class EnhancedBSEQuoteScraper:
         return None
 
     def enhanced_extract_data(self) -> Dict[str, Optional[str]]:
-        security_name = self._enhanced_find_security_name()
+        name_data = self._enhanced_find_security_name()
         basic_industry = self._enhanced_find_basic_industry()
-        print(f"Extraction results:")
-        print(f"  Security Name: {'Found' if security_name else 'Missing'} - '{security_name}'")
-        print(f"  Basic Industry: {'Found' if basic_industry else 'Missing'} - '{basic_industry}'")
+        print(f"=== EXTRACTION SUMMARY ===")
+        print(f"  Company Name: {'FOUND' if name_data['Company Name'] else 'MISSING'} - '{name_data['Company Name']}'")
+        print(f"  Security Name: {'FOUND' if name_data['Security Name'] else 'MISSING'} - '{name_data['Security Name']}'")
+        print(f"  Basic Industry: {'FOUND' if basic_industry else 'MISSING'} - '{basic_industry}'")
+        print(f"========================")
         return {
-            "Security Name": security_name,
+            "Company Name": name_data["Company Name"],
+            "Security Name": name_data["Security Name"],
             "Basic Industry": basic_industry
         }
 
@@ -262,20 +628,21 @@ class EnhancedBSEQuoteScraper:
             self.enhanced_open_scrip(scripcode)
             data = self.enhanced_extract_data()
             data["scripcode"] = scripcode
-            data["scraped_at"] = timezone.now()  # Use timezone-aware datetime directly
+            data["scraped_at"] = timezone.now()
             return data
         except Exception as e:
             print(f"Failed for {scripcode}: {str(e)}")
             return {
                 "scripcode": scripcode,
-                "scraped_at": timezone.now(),  # Use timezone-aware datetime
+                "scraped_at": timezone.now(),
                 "error": str(e),
+                "Company Name": None,
                 "Security Name": None,
                 "Basic Industry": None
             }
 
 class Command(BaseCommand):
-    help = "Streamlined BSE stock quotes scraper using Comprehensive Table Search for Basic Industry."
+    help = "Streamlined BSE stock quotes scraper for Company Name, Security Name, and Basic Industry."
 
     def add_arguments(self, parser):
         parser.add_argument("--scripcode", type=str, required=True, help="BSE scrip code, e.g. 500325")
@@ -306,9 +673,19 @@ class Command(BaseCommand):
                 self.stdout.write(f"Processing: {scripcode}")
                 row = scraper.scrape_scripcode_enhanced(scripcode)
 
+                # Print scraped data to terminal for verification
+                self.stdout.write(self.style.NOTICE("Scraped Data:"))
+                print(f"  Scripcode: {row['scripcode']}")
+                print(f"  Company Name: {'NOT FOUND' if not row.get('Company Name') else row['Company Name']}")
+                print(f"  Security Name: {'NOT FOUND' if not row.get('Security Name') else row['Security Name']}")
+                print(f"  Basic Industry: {'NOT FOUND' if not row.get('Basic Industry') else row['Basic Industry']}")
+                print(f"  Scraped At: {row['scraped_at']}")
+                if row.get('error'):
+                    print(f"  Error: {row['error']}")
+
                 try:
                     with transaction.atomic():
-                        scraped_datetime = row['scraped_at']  # Already timezone-aware
+                        scraped_datetime = row['scraped_at']
                         error_msg = row.get('error')
 
                         if error_msg:
@@ -318,30 +695,35 @@ class Command(BaseCommand):
                                     'error_message': error_msg,
                                     'scraped_at': scraped_datetime,
                                     'security_name': None,
+                                    'company_name': None,
                                     'basic_industry': None,
                                 }
                             )
                             self.stderr.write(self.style.ERROR(f"Error for {scripcode}: {error_msg}"))
                         else:
+                            company_name = row.get('Company Name')
                             security_name = row.get('Security Name')
                             basic_industry = row.get('Basic Industry')
                             stock_quote, created = BseStockQuote.objects.update_or_create(
                                 scripcode=scripcode,
                                 defaults={
                                     'security_name': security_name,
+                                    'company_name': company_name,
                                     'basic_industry': basic_industry,
                                     'scraped_at': scraped_datetime,
                                     'error_message': None,
                                 }
                             )
                             action = "Created" if created else "Updated"
-                            if security_name and basic_industry:
+                            if company_name and security_name and basic_industry:
                                 self.stdout.write(self.style.SUCCESS(f"{action} COMPLETE: {scripcode}"))
-                                print(f"  ✓ Name: {security_name}")
+                                print(f"  ✓ Company Name: {company_name}")
+                                print(f"  ✓ Security Name: {security_name}")
                                 print(f"  ✓ Industry: {basic_industry}")
                             else:
                                 self.stdout.write(self.style.WARNING(f"{action} PARTIAL: {scripcode}"))
-                                print(f"  ✓ Name: {'NOT FOUND' if not security_name else security_name}")
+                                print(f"  ✓ Company Name: {'NOT FOUND' if not company_name else company_name}")
+                                print(f"  ✓ Security Name: {'NOT FOUND' if not security_name else security_name}")
                                 print(f"  ✗ Industry: {'NOT FOUND' if not basic_industry else basic_industry}")
 
                 except Exception as db_error:
@@ -363,6 +745,7 @@ class Command(BaseCommand):
                             'error_message': error_msg,
                             'scraped_at': timezone.now(),
                             'security_name': None,
+                            'company_name': None,
                             'basic_industry': None,
                         }
                     )

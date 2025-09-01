@@ -146,6 +146,7 @@ class BseStockQuote(models.Model):
     # Scraped data fields
     security_name = models.CharField(max_length=255, null=True, blank=True)
     basic_industry = models.CharField(max_length=255, null=True, blank=True)
+    company_name = models.CharField(max_length=255, null=True, blank=True)
     
     # Metadata
     scraped_at = models.DateTimeField(null=True, blank=True)
