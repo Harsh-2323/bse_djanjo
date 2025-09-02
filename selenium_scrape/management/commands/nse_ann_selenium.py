@@ -1,779 +1,673 @@
-import re
-import time
-import json
-from datetime import datetime
-from typing import Dict, List, Optional
+# -*- coding: utf-8 -*-
+"""
+Scrape NSE Corporate Filings (Announcements) and save to **Database** (no Excel).
 
+- Cleans Subject (strips "Time Taken" etc.)
+- Captures PDF + XBRL links into separate columns
+- Parses XBRL (works with /api/xbrl/{id} JSON, ZIPs, XML/XBRL)
+- Shares Selenium cookies with requests so API calls behave like the browser
+"""
+
+import os, re, time, io, zipfile, json
+from urllib.parse import urljoin
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+import xml.etree.ElementTree as ET
 
-# Selenium / Browser
+# Selenium
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-# Driver manager (auto installs compatible ChromeDriver)
-from webdriver_manager.chrome import ChromeDriverManager
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+except Exception:
+    ChromeDriverManager = None
 
-# Excel / Data
-import pandas as pd
+# --- Model import (support either app layout) ---
+try:
+    # if both models live in selenium_scrape.models
+    from selenium_scrape.models import NseAnnouncement  # type: ignore
+except Exception:
+    from nse_scrape.models import NseAnnouncement  # type: ignore
 
-# API fallback
-import requests
+URL = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+HOMEPAGE = "https://www.nseindia.com"
 
+DT_RE = r"\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}"
+TIME_RE = r"\d{2}:\d{2}:\d{2}"
 
-BSE_STOCK_URL = "https://www.bseindia.com/stock-share-price/undefined/undefined/{scripcode}/"
+BROADCAST_LABEL_RE = re.compile(r"(Exchange\s*Received\s*Time|Exchange\s*Dissemination\s*Time|Time\s*Taken)", re.I)
+TIME_TAKEN_BLOCK_RE = re.compile(r"Time\s*Taken[:\s]*" + TIME_RE, re.I)
 
-# Labels we want to scrape from the rendered DOM.
-LABELS_TO_SCRAPE = [
-    # Price / OHLC
-    "LTP",
-    "Change",
-    "Prev Close",
-    "Open",
-    "High",
-    "Low",
-    "VWAP",
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 
-    # 52W / Bands
-    "52W High",
-    "52W Low",
-    "Upper Price Band",
-    "Lower Price Band",
+# ---------- selenium & session helpers ----------
+def _setup_driver(headless: bool):
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--window-size=1400,1000")
+    opts.add_argument(f"user-agent={UA}")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.page_load_strategy = "normal"
 
-    # Vol / Value
-    "TTQ",
-    "Turnover (Lakh)",
-    "Avg Qty 2W",
-
-    # Market Cap
-    "Mcap Full (Cr.)",
-    "Mcap FF (Cr.)",
-
-    # Fundamentals
-    "EPS (TTM)",
-    "CEPS (TTM)",
-    "PE",
-    "PB",
-    "ROE",
-    "Face Value",
-
-    # Classification
-    "Category",
-    "Group",
-    "Index",
-    "Basic Industry",
-]
-
-# Map aliases → canonical label (when DOM uses slightly different text)
-LABEL_ALIASES = {
-    "Turnover (Lac)": "Turnover (Lakh)",
-    "Turnover (Lakhs)": "Turnover (Lakh)",
-    "TTQ (Qty)": "TTQ",
-    "52 Week High": "52W High",
-    "52 Week Low": "52W Low",
-    "FaceVal": "Face Value",
-    "Index Name": "Index",
-    "Industry": "Basic Industry",
-    "Mcap Full (Cr)": "Mcap Full (Cr.)",
-    "Mcap FF (Cr)": "Mcap FF (Cr.)",
-    "2W Avg Qty": "Avg Qty 2W",
-}
-
-
-# ----------------- Utils -----------------
-
-def clean_text(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s or None
-
-
-def as_float_or_str(v: Optional[str]) -> Optional[str]:
-    """Keep numeric-looking values tidy; leave others as-is."""
-    if v is None:
-        return None
-    tv = v.replace(",", "").strip()
-    # Handle negative values and percentages
-    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?%?", tv):
-        return tv.replace("%", "")  # Remove % for cleaner numeric data
-    return v
-
-
-def is_likely_navigation_text(text: str) -> bool:
-    """Filter out navigation/header text that shouldn't be data values."""
-    if not text:
-        return True
-    
-    nav_indicators = [
-        "skip to main content",
-        "high contrast",
-        "reset",
-        "select language",
-        "group websites",
-        "notices",
-        "media release",
-        "trading holidays",
-        "contact us",
-        "feedback",
-        "bse sme",
-        "bseplus",
-        "payments to bse"
-    ]
-    
-    text_lower = text.lower()
-    return any(indicator in text_lower for indicator in nav_indicators)
-
-
-def extract_numeric_from_combined(text: str, target_label: str) -> Optional[str]:
-    """Extract specific numeric values from combined text like '52 Wk High 1,003.20 52 Wk Low 530.50'."""
-    if not text or not target_label:
-        return None
-    
-    patterns = {
-        "52W High": [r"52\s*W(?:eek)?\s*High\s*:?\s*([\d,]+(?:\.\d+)?)", r"52\s*Wk\s*High\s*:?\s*([\d,]+(?:\.\d+)?)"],
-        "52W Low": [r"52\s*W(?:eek)?\s*Low\s*:?\s*([\d,]+(?:\.\d+)?)", r"52\s*Wk\s*Low\s*:?\s*([\d,]+(?:\.\d+)?)"],
-        "Change": [r"Change\s*:?\s*([+-]?[\d,]+(?:\.\d+)?(?:\s*\([+-]?[\d,]+(?:\.\d+)?%?\))?)", r"Chg\s*:?\s*([+-]?[\d,]+(?:\.\d+)?)"],
-        "PE": [r"PE\s*[:/]?\s*([+-]?[\d,]+(?:\.\d+)?)", r"P/E\s*:?\s*([+-]?[\d,]+(?:\.\d+)?)"],
-        "PB": [r"PB\s*[:/]?\s*([+-]?[\d,]+(?:\.\d+)?)", r"P/B\s*:?\s*([+-]?[\d,]+(?:\.\d+)?)"],
-        "ROE": [r"ROE\s*:?\s*([+-]?[\d,]+(?:\.\d+)?%?)", r"Return\s+on\s+Equity\s*:?\s*([+-]?[\d,]+(?:\.\d+)?%?)"],
-        "Basic Industry": [r"Basic\s+Industry\s*:?\s*([A-Za-z\s&,-]+)(?:\s|$)", r"Industry\s*:?\s*([A-Za-z\s&,-]+)(?:\s|$)"],
-        "Group": [r"Group\s*[:/]?\s*([A-Za-z0-9\s/+.-]+?)(?:\s+[A-Z]|$)", r"Settlement\s+Type\s*:?\s*([A-Za-z0-9\s/+.-]+?)(?:\s|$)"],
-    }
-    
-    if target_label in patterns:
-        for pattern in patterns[target_label]:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                result = match.group(1).strip()
-                if target_label in ["Basic Industry", "Group"] and len(result) > 50:
-                    result = result[:50].strip()
-                return result
-    
-    escaped_label = re.escape(target_label).replace(r"\ ", r"\s+")
-    generic_patterns = [
-        rf"{escaped_label}\s*:?\s*([\d,]+(?:\.\d+)?%?)",
-        rf"{escaped_label}\s*[:/]\s*([A-Za-z0-9\s,.-]+?)(?:\s+[A-Z]|$)",
-    ]
-    
-    for pattern in generic_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    
-    return None
-
-
-# ----------------- Industry Classification Helpers -----------------
-
-def _click_industry_info_button(driver, debug: bool = False) -> Dict[str, str]:
-    """Find and click the 'i' button to get industry classification info."""
-    try:
-        info_buttons = driver.find_elements(By.XPATH, "//td[@class='textsr' and contains(text(), 'Basic Industry')]/a[@data-bs-toggle='modal' and @data-bs-target='#catinfo']")
-        
-        if not info_buttons:
-            info_buttons = driver.find_elements(By.XPATH, 
-                "//*[contains(text(), 'Basic Industry')]/a[@data-bs-toggle='modal' and contains(@class, 'social-icon') and descendant::img[@src='/include/images/iicon.png']]")
-        
-        for button in info_buttons:
-            try:
-                driver.execute_script("arguments[0].scrollIntoView(true);", button)
-                time.sleep(0.5)
-                button.click()
-                WebDriverWait(driver, 10).until(EC.visibility_of_element_located((By.ID, "catinfo")))
-                industry_info = _extract_industry_classification_modal(driver, debug=debug)
-                if industry_info:
-                    _close_modal(driver)
-                    return industry_info
-            except Exception as e:
-                if debug:
-                    print(f"Error clicking info button: {e}")
-                continue
-        if debug:
-            print("No industry info button found")
-        return {}
-    except Exception as e:
-        if debug:
-            print(f"Error finding industry info button: {e}")
-        return {}
-
-
-def _extract_industry_classification_modal(driver, debug: bool = False) -> Dict[str, str]:
-    """Extract industry classification information from the opened modal."""
-    try:
-        industry_info = {
-            "Macro Economic Indicator": "",
-            "Sector": "",
-            "Industry": "",
-            "Basic Industry": ""
-        }
-        
-        modal = driver.find_element(By.ID, "catinfo")
-        table = modal.find_element(By.TAG_NAME, "table")
-        rows = table.find_elements(By.TAG_NAME, "tr")
-        
-        if debug:
-            print(f"Modal rows found: {len(rows)}")
-        
-        data_rows = [row for row in rows if len(row.find_elements(By.TAG_NAME, "td")) == 3]
-        for row in data_rows:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) == 3:
-                key = clean_text(cells[0].text).lower()
-                value = clean_text(cells[2].text)
-                if "macro-economic indicator" in key:
-                    industry_info["Macro Economic Indicator"] = value
-                elif "sector" in key:
-                    industry_info["Sector"] = value
-                elif "industry" in key and "basic" not in key:
-                    industry_info["Industry"] = value
-                elif "basic industry" in key:
-                    industry_info["Basic Industry"] = value
-        
-        if debug:
-            print(f"Extracted industry info: {industry_info}")
-        return industry_info
-    except Exception as e:
-        if debug:
-            print(f"Error extracting industry classification: {e}")
-        return {}
-
-
-def _close_modal(driver):
-    """Close any open modal/popup."""
-    try:
-        close_button = driver.find_element(By.CLASS_NAME, "btn-close")
-        close_button.click()
-        time.sleep(0.5)
-    except Exception:
-        from selenium.webdriver.common.keys import Keys
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        time.sleep(0.5)
-
-
-def _fetch_industry_from_api(scripcode: str) -> Dict[str, str]:
-    """
-    Read classification directly from BSE 'ComHeadernew' API and map it to the four fields
-    shown in the 'i' modal. Returns empty strings if anything is missing.
-    """
-    out = {
-        "Macro Economic Indicator": "",
-        "Sector": "",
-        "Industry": "",
-        "Basic Industry": "",
-    }
-    try:
-        url = f"https://api.bseindia.com/BseIndiaAPI/api/ComHeadernew/w?quotetype=EQ&scripcode={scripcode}&seriesid="
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        j = r.json() if r.content else {}
-
-        # Modal "Macro-Economic Indicator"  ← API 'Sector'
-        # Modal "Sector"                    ← API 'IndustryNew'
-        # Modal "Industry"                  ← API 'IGroup'
-        # Modal "Basic Industry"            ← API 'Industry' (fallback 'ISubGroup')
-        out["Macro Economic Indicator"] = (j.get("Sector") or "").strip()
-        out["Sector"] = (j.get("IndustryNew") or "").strip()
-        out["Industry"] = (j.get("IGroup") or "").strip()
-        out["Basic Industry"] = (j.get("Industry") or j.get("ISubGroup") or "").strip()
-    except Exception:
-        pass
-    return out
-
-
-# ----------------- Scraper -----------------
-
-class BSEQuoteScraper:
-    def __init__(self, headless: bool = True, page_timeout: int = 30):
-        self.headless = headless
-        self.page_timeout = page_timeout
-        self.driver = None
-
-    def __enter__(self):
-        self.driver = self._new_driver()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self.driver:
-                self.driver.quit()
-        finally:
-            self.driver = None
-
-    def _new_driver(self):
-        chrome_opts = ChromeOptions()
-        if self.headless:
-            chrome_opts.add_argument("--headless=new")
-        chrome_opts.add_argument("--disable-gpu")
-        chrome_opts.add_argument("--no-sandbox")
-        chrome_opts.add_argument("--window-size=1400,1000")
-        chrome_opts.add_argument("--disable-dev-shm-usage")
-        chrome_opts.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_opts.add_argument("--lang=en-US,en")
-        chrome_opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-
-        chrome_prefs = {"profile.default_content_setting_values.notifications": 2}
-        chrome_opts.add_experimental_option("prefs", chrome_prefs)
-
+    if ChromeDriverManager:
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_opts)
-        driver.set_page_load_timeout(self.page_timeout)
-        driver.implicitly_wait(0)
-        return driver
+    else:
+        service = Service(os.environ.get("CHROMEDRIVER", "chromedriver"))
+    return webdriver.Chrome(service=service, options=opts)
 
-    def open_scrip(self, scripcode: str, total_wait: int = 20):
-        url = BSE_STOCK_URL.format(scripcode=scripcode)
-        print(f"Opening URL: {url}")
-        self.driver.get(url)
 
-        wait = WebDriverWait(self.driver, total_wait)
-        success = False
-        wait_strategies = [
-            "//div[contains(@class, 'stock-detail') or contains(@class, 'quote')]",
-            "//*[contains(text(), 'LTP') or contains(text(), 'Last Traded Price')]",
-            "//table[.//td[contains(text(), 'LTP')]]",
-            "//*[contains(text(), 'BSE') and contains(text(), 'Stock')]"
-        ]
-        for strategy in wait_strategies:
-            try:
-                wait.until(EC.presence_of_element_located((By.XPATH, strategy)))
-                success = True
-                print(f"Page loaded successfully using strategy: {strategy}")
+def _session_from_driver(driver) -> requests.Session:
+    """Clone NSE cookies from Selenium into a requests.Session."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+    for c in driver.get_cookies():
+        dom = c.get("domain") or "www.nseindia.com"
+        if "nseindia.com" not in dom:
+            continue
+        s.cookies.set(
+            c.get("name"), c.get("value", ""),
+            domain=dom, path=c.get("path", "/")
+        )
+    return s
+
+
+def _wait_table(driver, timeout=30):
+    wait = WebDriverWait(driver, timeout)
+    wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
+    wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")) >= 1)
+    return driver.find_element(By.ID, "CFanncEquityTable")
+
+
+def _load_enough_rows(driver, max_rows: int, pause: float, stall_tolerance: int):
+    scroll_el = _wait_table(driver, timeout=30)
+    prev = 0
+    stalled = 0
+    while True:
+        rows = driver.find_elements(By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")
+        if len(rows) >= max_rows:
+            break
+        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", scroll_el)
+        time.sleep(pause)
+        new_count = len(driver.find_elements(By.CSS_SELECTOR, "#CFanncEquityTable tbody tr"))
+        if new_count == prev:
+            stalled += 1
+            if stalled >= stall_tolerance:
                 break
-            except TimeoutException:
-                continue
-        if not success:
-            print("Warning: Could not confirm page loaded properly")
-        time.sleep(2)
+        else:
+            stalled = 0
+            prev = new_count
 
-    def _find_value_by_multiple_strategies(self, label: str) -> Optional[str]:
-        d = self.driver
-        
-        table_strategies = [
-            f"//table//tr[td[normalize-space(text())='{label}'] or td[normalize-space(text())='{label}:']]/td[2]",
-            f"//table//tr[th[normalize-space(text())='{label}'] or th[normalize-space(text())='{label}:']]/td[1]",
-            f"//table//tr[td[normalize-space(text())='{label}'] or td[normalize-space(text())='{label}:']]/td[last()]",
-        ]
-        for xpath in table_strategies:
-            try:
-                element = d.find_element(By.XPATH, xpath)
-                text = clean_text(element.text)
-                if text and not is_likely_navigation_text(text):
-                    return text
-            except NoSuchElementException:
-                continue
-        
-        div_strategies = [
-            f"//div[span[normalize-space(text())='{label}:' or normalize-space(text())='{label}']]/span[last()]",
-            f"//div[contains(@class, 'data') or contains(@class, 'info')][.//text()[normalize-space()='{label}:' or normalize-space()='{label}']]//*[self::span or self::div][last()]",
-            f"//*[normalize-space(text())='{label}:']/following-sibling::*[1]",
-            f"//*[normalize-space(text())='{label}']/following-sibling::*[1]",
-            f"//*[normalize-space(text())='{label}:']/following::*[self::span or self::div or self::strong or self::b][1]",
-        ]
-        for xpath in div_strategies:
-            try:
-                element = d.find_element(By.XPATH, xpath)
-                text = clean_text(element.text)
-                if text and not is_likely_navigation_text(text) and text.lower() != label.lower():
-                    return text
-            except NoSuchElementException:
-                continue
-        
-        bse_specific_strategies = [
-            f"//*[contains(@class, 'value') or contains(@class, 'price') or contains(@class, 'data')][preceding-sibling::*[normalize-space(text())='{label}:' or normalize-space(text())='{label}']]",
-            f"//div[contains(@class, 'quote') or contains(@class, 'stock')]//*[normalize-space(text())='{label}:']/following-sibling::*[1]",
-            f"//*[text()[normalize-space()='{label}:' or normalize-space()='{label}']]/following-sibling::text()[1]",
-        ]
-        for xpath in bse_specific_strategies:
-            try:
-                if xpath.endswith("/text()[1]"):
-                    elements = d.find_elements(By.XPATH, xpath.replace("/text()[1]", ""))
-                    for element in elements:
-                        script = """
-                        var walker = document.createTreeWalker(
-                            arguments[0].parentNode,
-                            NodeFilter.SHOW_TEXT,
-                            null,
-                            false
-                        );
-                        var node = walker.nextNode();
-                        while (node && node !== arguments[0].firstChild) {
-                            node = walker.nextNode();
-                        }
-                        if (node) node = walker.nextNode();
-                        return node ? node.textContent.trim() : '';
-                        """
-                        try:
-                            text = d.execute_script(script, element)
-                            if text and not is_likely_navigation_text(text):
-                                return text
-                        except Exception:
-                            continue
-                else:
-                    element = d.find_element(By.XPATH, xpath)
-                    text = clean_text(element.text)
-                    if text and not is_likely_navigation_text(text):
-                        return text
-            except NoSuchElementException:
-                continue
-        
-        try:
-            page_text = d.find_element(By.TAG_NAME, "body").text
-            extracted = extract_numeric_from_combined(page_text, label)
-            if extracted:
-                return extracted
-        except Exception:
-            pass
-        
-        flexible_strategies = [
-            f"//*[contains(normalize-space(text()), '{label}')]/following::*[self::span or self::div or self::td][1]",
-            f"//*[self::div or self::span or self::li][contains(normalize-space(.), '{label}:')]/following::*[self::span or self::div or self::strong][1]",
-            f"//li[contains(normalize-space(.), '{label}')]//*[self::span or self::div][last()]",
-            f"//*[@title='{label}' or @aria-label='{label}']/following-sibling::*[1]",
-        ]
-        for xpath in flexible_strategies:
-            try:
-                element = d.find_element(By.XPATH, xpath)
-                text = clean_text(element.text)
-                if text and not is_likely_navigation_text(text) and len(text) < 50 and text.lower() != label.lower():
-                    if re.match(r'^[+-]?\d+(?:[.,]\d+)?(?:\s*%)?$|^[A-Za-z0-9\s/.-]+$', text):
-                        return text
-            except NoSuchElementException:
-                continue
-        
+
+# ---------- table parsing helpers ----------
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _build_header_map(soup: BeautifulSoup) -> dict:
+    headers = soup.select("#CFanncEquityTable thead th")
+    colmap = {}
+    for idx, th in enumerate(headers):
+        key = _norm(th.get_text(" ", strip=True))
+        if key:
+            colmap[key] = idx
+    return colmap
+
+
+def _cell_text(td):
+    txt = td.get_text(" ", strip=True) if td else ""
+    txt = txt.replace("Read More", "").replace("Read Less", "").strip()
+    return re.sub(r"\s{2,}", " ", txt)
+
+
+def _has_pdf_link(td) -> bool:
+    return bool(td and td.select_one('a[href*=".pdf" i]'))
+
+
+def _has_xbrl_link(td) -> bool:
+    if not td:
+        return False
+    sel = td.select_one('a[href*=".xml" i], a[href*=".xbrl" i], a[href*=".zip" i], a[href*="xbrl" i]')
+    if not sel:
+        return False
+    href = (sel.get("href") or "").lower()
+    return (".xml" in href or ".xbrl" in href or "xbrl" in href or href.endswith(".zip"))
+
+
+def _looks_like_symbol(s: str) -> bool:
+    if not s or len(s) > 20:
+        return False
+    if re.search(DT_RE, s):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9&/\-\. ]{1,20}", s)) and any(ch.isalpha() for ch in s)
+
+
+def _looks_like_company(s: str) -> bool:
+    if not s:
+        return False
+    if _is_broadcast_text(s):
+        return False
+    if s.strip().lower() in {"data", "details"}:
+        return False
+    if len(s.split()) < 2:
+        return False
+    if re.search(r"(limited|ltd|industries|bank|services|international|private|plc|labs|pharma|technolog|finance|infra|steel|engineer|chemical|cement|energy|motors|foods|capital)", s, flags=re.I):
+        return True
+    alpha_ratio = sum(ch.isalpha() for ch in s) / max(1, len(s))
+    return alpha_ratio > 0.5 and not s.isupper()
+
+
+def _is_broadcast_text(s: str) -> bool:
+    if not s:
+        return False
+    if BROADCAST_LABEL_RE.search(s):
+        return True
+    if TIME_TAKEN_BLOCK_RE.search(s):
+        return True
+    return len(re.findall(DT_RE, s)) >= 2
+
+
+def _parse_broadcast_text(s: str):
+    res = {"Exchange Received Time": "", "Exchange Dissemination Time": "", "Time Taken": ""}
+    if not s:
+        return res
+    s1 = re.sub(r"\s+", " ", s.strip())
+
+    rec = re.search(r"Exchange\s*Received\s*Time[:\s]+(" + DT_RE + r")", s1, flags=re.I)
+    dis = re.search(r"Exchange\s*Dissemination\s*Time[:\s]+(" + DT_RE + r")", s1, flags=re.I)
+    taken = re.search(r"Time\s*Taken[:\s]+(" + TIME_RE + r")", s1, flags=re.I)
+
+    if not (rec and dis):
+        dts = re.findall(DT_RE, s1)
+        if not rec and len(dts) >= 1:
+            res["Exchange Received Time"] = dts[0]
+        if not dis and len(dts) >= 2:
+            res["Exchange Dissemination Time"] = dts[1]
+    else:
+        res["Exchange Received Time"] = rec.group(1)
+        res["Exchange Dissemination Time"] = dis.group(1)
+
+    if taken:
+        res["Time Taken"] = taken.group(1)
+    return res
+
+
+def _strip_broadcast_bits(s: str) -> str:
+    if not s:
+        return s
+    s2 = re.sub(r"Exchange\s*Received\s*Time.*?(?=Exchange|Time\s*Taken|$)", "", s, flags=re.I | re.DOTALL).strip()
+    s2 = re.sub(r"Exchange\s*Dissemination\s*Time.*?(?=Exchange|Time\s*Taken|$)", "", s2, flags=re.I | re.DOTALL).strip()
+    s2 = re.sub(r"Time\s*Taken[:\s]*" + TIME_RE + r".*?$", "", s2, flags=re.I | re.DOTALL).strip()
+    s2 = re.sub(r"\s+" + TIME_RE + r"(?:\s|$)", " ", s2, flags=re.I).strip()
+    s2 = re.sub(r"(?:Exchange|Time\s*Taken).*?$", "", s2, flags=re.I).strip()
+    return s2
+
+
+def _clean_subject(s: str) -> str:
+    if not s:
+        return s
+    s2 = _strip_broadcast_bits(s)
+    s2 = re.sub(r"\s+" + DT_RE + r"\s*$", "", s2).strip()
+    s2 = re.sub(r"\s+" + TIME_RE + r"\s*$", "", s2).strip()
+    s2 = re.sub(r"(?:Exchange\s*(?:Received|Dissemination)\s*Time|Time\s*Taken).*?$", "", s2, flags=re.I).strip()
+    if s2.strip().lower() in {"data", "details", "time", "taken", "exchange"}:
+        return ""
+    if re.fullmatch(r"[\d:\s]+", s2.strip()):
+        return ""
+    return s2
+
+
+def _in_range(i, arr) -> bool:
+    return i is not None and 0 <= i < len(arr)
+
+
+def _pick_subject_candidate(texts, banned_idx):
+    best_idx, best_val, best_len = None, "", -1
+    for i, t in enumerate(texts):
+        if i in banned_idx:
+            continue
+        if not t:
+            continue
+        if _is_broadcast_text(t):
+            continue
+        if re.search(TIME_RE, t) and len(t.strip()) < 50:
+            continue
+        tt = _clean_subject(t)
+        if not tt:
+            continue
+        if len(tt) > best_len:
+            best_idx, best_val, best_len = i, tt, len(tt)
+    return best_idx, best_val
+
+
+# ---------- XBRL utils ----------
+def _iter_localname(e):
+    """Yield (localname, element) for all descendants including root."""
+    stack = [e]
+    while stack:
+        cur = stack.pop()
+        local = cur.tag.split('}', 1)[-1] if '}' in cur.tag else cur.tag
+        yield local, cur
+        stack.extend(list(cur))
+
+
+def _find_first_text(root, names):
+    for lname, el in _iter_localname(root):
+        if lname in names:
+            t = (el.text or "").strip()
+            if t:
+                return t
+    return ""
+
+
+def _choose_zip_member(namelist):
+    """Pick the most likely XBRL instance file inside a zip."""
+    candidates = [n for n in namelist if n.lower().endswith((".xml", ".xbrl"))]
+    if not candidates:
         return None
+    pri = sorted(
+        candidates,
+        key=lambda n: (
+            0 if "inst" in n.lower() or "instance" in n.lower() else 1,
+            0 if "capmkt" in n.lower() else 1,
+            len(n)
+        )
+    )
+    return pri[0]
 
-    def extract_tiles(self) -> Dict[str, Optional[str]]:
-        data: Dict[str, Optional[str]] = {}
 
-        # Extract timestamp
-        timestamp = None
-        timestamp_strategies = [
-            "//*[contains(text(), 'As on') or contains(text(), 'As Of')]/text()",
-            "//*[contains(text(), 'Updated')]/text()",
-            "//*[@class='timestamp' or contains(@class, 'time')]/text()",
-        ]
-        for xpath in timestamp_strategies:
+def _parse_xbrl_bytes(xml_bytes, debug=False):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        return None, f"parse_error: {e}"
+
+    data = {
+        "XBRL NSE Symbol": _find_first_text(root, {"NSESymbol", "Symbol"}),
+        "XBRL Company Name": _find_first_text(root, {"NameOfTheCompany", "CompanyName", "NameOfCompany"}),
+        "XBRL Subject": _find_first_text(root, {"SubjectOfAnnouncement", "Subject"}),
+        "XBRL Description": _find_first_text(root, {"DescriptionOfAnnouncement", "Description"}),
+        "XBRL Attachment URL": _find_first_text(root, {"AttachmentURL", "AttachmentUrl", "AttachmentLink", "PdfURL", "PDFURL"}),
+        "XBRL DateTime": _find_first_text(root, {"DateAndTimeOfSubmission", "DateOfSubmission", "DateTime"}),
+        "XBRL Category": _find_first_text(root, {"CategoryOfAnnouncement", "Category"}),
+    }
+    for k in list(data.keys()):
+        data[k] = (data[k] or "").strip()
+    ok = any(data.values())
+    return (data if ok else None), ("ok" if ok else "empty_xbrl")
+
+
+def _find_urls_in_json(obj):
+    """Yield all strings in a JSON that look like URLs (pref xbrl/xml/zip)."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str):
+            s = cur.strip()
+            if s.startswith("http"):
+                yield s
+
+
+def _prefer_xbrl_url(urls):
+    """Pick best candidate pointing to actual instance file."""
+    pri = sorted(
+        urls,
+        key=lambda u: (
+            0 if re.search(r"\.(xbrl|xml)(?:$|\?)", u.lower()) else 1,
+            0 if "xbrl" in u.lower() else 1,
+            0 if u.lower().endswith(".zip") else 2,
+            len(u)
+        )
+    )
+    return pri[0] if pri else None
+
+
+def _extract_fields_from_json(j):
+    """Best-effort field pull when the API returns decoded XBRL as JSON."""
+    flat = {}
+    stack = [(None, j)]
+    while stack:
+        k, v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.items())
+        elif isinstance(v, list):
+            stack.extend([(k, x) for x in v])
+        else:
+            key = (k or "").lower()
+            if isinstance(v, str):
+                if "symbol" in key and "nse" in key: flat["XBRL NSE Symbol"] = v
+                elif "company" in key and "name" in key: flat["XBRL Company Name"] = v
+                elif "subject" in key: flat["XBRL Subject"] = v
+                elif "description" in key: flat["XBRL Description"] = v
+                elif "attachment" in key and ("url" in key or "link" in key): flat["XBRL Attachment URL"] = v
+                elif "datetime" in key or ("date" in key and "time" in key): flat["XBRL DateTime"] = v
+                elif "category" in key: flat["XBRL Category"] = v
+    return {k: v for k, v in flat.items() if v}
+
+
+def _fetch_and_parse_xbrl(url, session: requests.Session, debug=False):
+    """Fetch URL that may be an API JSON, a ZIP, or an XML/XBRL, then parse."""
+    try:
+        r = session.get(url, timeout=30, allow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:
+        return None, f"http_error: {e}"
+
+    ct = (r.headers.get("Content-Type") or "").lower()
+    body = r.content or b""
+
+    # CASE A: JSON wrapper like /api/xbrl/{id}
+    is_jsonish = "json" in ct or (body[:1] in (b"{", b"["))
+    if is_jsonish:
+        try:
+            j = r.json()
+        except Exception:
             try:
-                element = self.driver.find_element(By.XPATH, xpath.replace("/text()", ""))
-                text = clean_text(element.text)
-                if text and ("as on" in text.lower() or "updated" in text.lower()):
-                    timestamp = text
-                    break
-            except NoSuchElementException:
-                continue
-        data["as_of"] = timestamp
+                j = json.loads(body.decode("utf-8", "ignore"))
+            except Exception as e:
+                return None, f"json_error: {e}"
 
-        # Extract industry classification via modal
-        industry_info = _click_industry_info_button(self.driver, debug=True)
-        data.update({
-            "Macro Economic Indicator": industry_info.get("Macro Economic Indicator", ""),
-            "Sector": industry_info.get("Sector", ""),
-            "Industry": industry_info.get("Industry", ""),
-            "Basic Industry": industry_info.get("Basic Industry", data.get("Basic Industry", ""))
-        })
+        urls = list(_find_urls_in_json(j))
+        cand = _prefer_xbrl_url(urls)
+        if cand:
+            return _fetch_and_parse_xbrl(urljoin(URL, cand), session, debug=debug)
 
-        # Extract all the data fields
-        for label in LABELS_TO_SCRAPE:
-            value = self._find_value_by_multiple_strategies(label)
-            
-            if value is None:
-                for alias, canonical in LABEL_ALIASES.items():
-                    if canonical == label:
-                        value = self._find_value_by_multiple_strategies(alias)
-                        if value:
-                            break
-            
-            if value is None:
-                if label == "Change":
-                    try:
-                        page_text = self.driver.find_element(By.TAG_NAME, "body").text
-                        change_patterns = [
-                            r"Change\s*:?\s*([+-]?\d+(?:\.\d+)?)\s*\(\s*([+-]?\d+(?:\.\d+)?)%\s*\)",
-                            r"([+-]?\d+(?:\.\d+)?)\s*\(\s*([+-]?\d+(?:\.\d+)?)%\s*\)",
-                            r"Chg\s*:?\s*([+-]?\d+(?:\.\d+)?)",
-                        ]
-                        for pattern in change_patterns:
-                            match = re.search(pattern, page_text)
-                            if match:
-                                if len(match.groups()) >= 2:
-                                    data["ChangeAbs"] = match.group(1)
-                                    data["ChangePct"] = match.group(2)
-                                    value = f"{match.group(1)} ({match.group(2)}%)"
-                                else:
-                                    value = match.group(1)
-                                break
-                    except Exception:
-                        pass
-                elif label in ["52W High", "52W Low"]:
-                    try:
-                        page_text = self.driver.find_element(By.TAG_NAME, "body").text
-                        extracted = extract_numeric_from_combined(page_text, label)
-                        if extracted:
-                            value = extracted
-                    except Exception:
-                        pass
-                elif label == "PE":
-                    try:
-                        page_text = self.driver.find_element(By.TAG_NAME, "body").text
-                        pe_patterns = [
-                            r"PE[/\s]*PB\s*([\d,]+(?:\.\d+)?)\s*/\s*([\d,]+(?:\.\d+)?)",
-                            r"PE\s*:?\s*([\d,]+(?:\.\d+)?)",
-                            r"P/E\s*:?\s*([\d,]+(?:\.\d+)?)",
-                        ]
-                        for pattern in pe_patterns:
-                            match = re.search(pattern, page_text, re.IGNORECASE)
-                            if match:
-                                value = match.group(1)
-                                if len(match.groups()) >= 2 and data.get("PB") is None:
-                                    data["PB"] = match.group(2)
-                                break
-                    except Exception:
-                        pass
-            
-            if value:
-                if label == "PE" and "/" in value and not data.get("ChangeAbs"):
-                    parts = value.split("/")
-                    if len(parts) >= 1:
-                        value = clean_text(parts[0])
-                elif label == "PB" and "/" in value and not data.get("ChangeAbs"):
-                    parts = value.split("/")
-                    if len(parts) >= 2:
-                        value = clean_text(parts[1])
-                if label == "ROE" and "%" in value:
-                    value = value.replace("%", "").strip()
-            
-            data[label] = as_float_or_str(clean_text(value))
+        data = _extract_fields_from_json(j)
+        if data:
+            return data, "ok_json"
 
-        if not data.get("ChangeAbs") and not data.get("ChangePct"):
-            chg_str = data.get("Change")
-            if chg_str and "(" in chg_str and "%" in chg_str:
-                m = re.search(r"([+-]?\d+(?:\.\d+)?)\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*%?\s*\)", chg_str)
-                if m:
-                    data["ChangeAbs"] = m.group(1)
-                    data["ChangePct"] = m.group(2)
-        
-        return data
+        return None, "json_no_urls"
 
-    def scrape_scripcode(self, scripcode: str, post_load_sleep: float = 1.0) -> Dict[str, Optional[str]]:
-        self.open_scrip(scripcode)
-        time.sleep(post_load_sleep)
-        row = self.extract_tiles()
-        row["scripcode"] = scripcode
-        row["scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # CASE B: ZIP package
+    if url.lower().endswith(".zip") or "zip" in ct:
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as zf:
+                member = _choose_zip_member(zf.namelist())
+                if not member:
+                    return None, "zip_no_xml"
+                xml_bytes = zf.read(member)
+        except Exception as e:
+            return None, f"zip_error: {e}"
+        return _parse_xbrl_bytes(xml_bytes, debug=debug)
 
-        # Fill missing classification fields from API (non-invasive)
-        api_cls = _fetch_industry_from_api(scripcode)
-        for k in ["Macro Economic Indicator", "Sector", "Industry", "Basic Industry"]:
-            if not row.get(k):
-                row[k] = api_cls.get(k, "")
-
-        # Debug: Print what we found
-        print(f"Scraped data for {scripcode}:")
-        for key, value in row.items():
-            if value and key not in ["scraped_at", "scripcode"]:
-                print(f"  {key}: {value}")
-        
-        return row
+    # CASE C: XML/XBRL inline
+    return _parse_xbrl_bytes(body, debug=debug)
 
 
-# ----------------- Django command -----------------
+# ---------- extraction ----------
+def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bool=True, http_sess: requests.Session | None=None) -> pd.DataFrame:
+    soup = BeautifulSoup(driver.page_source, "lxml")
+    colmap = _build_header_map(soup)
+    if debug:
+        print("Detected headers:", colmap)
 
+    rows = soup.select("#CFanncEquityTable tbody tr")
+    out = []
+
+    # HTTP session (shared cookies)
+    sess = http_sess or requests.Session()
+    sess.headers.update({"User-Agent": UA, "Referer": URL})
+
+    for r in rows[:max_rows]:
+        tds = r.find_all("td")
+        if not tds:
+            continue
+
+        texts = [_cell_text(td) for td in tds]
+
+        # 1) detect broadcast cell by content
+        b_idx = next((i for i, t in enumerate(texts) if _is_broadcast_text(t)), None)
+
+        # 2) detect attachment
+        idx_attach = colmap.get("attachment")
+        if not _in_range(idx_attach, tds):
+            idx_attach = next((i for i, td in enumerate(tds) if _has_pdf_link(td) or _has_xbrl_link(td)), None)
+
+        # 3) symbol/company via headers or heuristics
+        idx_symbol = colmap.get("symbol")
+        if not _in_range(idx_symbol, tds) or not _looks_like_symbol(texts[idx_symbol]):
+            idx_symbol = next((i for i, t in enumerate(texts)
+                               if _looks_like_symbol(t) and i not in {b_idx, idx_attach}), None)
+
+        idx_company = colmap.get("companyname") or colmap.get("company")
+        if not _in_range(idx_company, tds) or not _looks_like_company(texts[idx_company]):
+            cand = None
+            if _in_range(idx_symbol, tds):
+                for nb in (idx_symbol + 1, idx_symbol - 1):
+                    if _in_range(nb, tds) and _looks_like_company(texts[nb]) and nb not in {b_idx, idx_attach}:
+                        cand = nb
+                        break
+            if cand is None:
+                cand = next((i for i, t in enumerate(texts)
+                             if _looks_like_company(t) and i not in {b_idx, idx_attach, idx_symbol}), None)
+            idx_company = cand
+
+        # 4) subject: header if valid; else longest clean text
+        idx_subject = colmap.get("subject")
+        if not _in_range(idx_subject, tds) or _is_broadcast_text(texts[idx_subject]):
+            banned = {x for x in [b_idx, idx_attach, idx_symbol, idx_company] if _in_range(x, tds)}
+            idx_subject, subj_text = _pick_subject_candidate(texts, banned)
+        else:
+            subj_text = _clean_subject(texts[idx_subject])
+
+        symbol = texts[idx_symbol] if _in_range(idx_symbol, tds) and _looks_like_symbol(texts[idx_symbol]) else ""
+        company_name = texts[idx_company] if _in_range(idx_company, tds) and _looks_like_company(texts[idx_company]) else ""
+
+        subject = _clean_subject(subj_text or "")
+        subject = _strip_broadcast_bits(subject)
+
+        # broadcast split
+        rec = dis = taken = ""
+        if _in_range(b_idx, tds):
+            bd = _parse_broadcast_text(texts[b_idx])
+            rec, dis, taken = bd["Exchange Received Time"], bd["Exchange Dissemination Time"], bd["Time Taken"]
+
+        # --- attachments (PDF + XBRL) ---
+        pdf_links, xbrl_links = [], []
+
+        def _scan_td_for_links(td):
+            urls = []
+            for a in td.select('a[href]'):
+                href = a.get("href") or ""
+                if not href:
+                    continue
+                urls.append(urljoin(URL, href))
+            return urls
+
+        if _in_range(idx_attach, tds):
+            for u in _scan_td_for_links(tds[idx_attach]):
+                lu = u.lower()
+                if ".pdf" in lu:
+                    pdf_links.append(u)
+                elif any(x in lu for x in [".xml", ".xbrl", "xbrl", ".zip"]):
+                    xbrl_links.append(u)
+        else:
+            for td in tds:
+                for u in _scan_td_for_links(td):
+                    lu = u.lower()
+                    if ".pdf" in lu:
+                        pdf_links.append(u)
+                    elif any(x in lu for x in [".xml", ".xbrl", "xbrl", ".zip"]):
+                        xbrl_links.append(u)
+
+        # de-dup keep order
+        def _dedup(seq):
+            seen, outl = set(), []
+            for x in seq:
+                if x not in seen:
+                    seen.add(x)
+                    outl.append(x)
+            return outl
+
+        pdf_links = _dedup(pdf_links)
+        xbrl_links = _dedup(xbrl_links)
+
+        row = {
+            "Symbol": symbol,
+            "Company Name": company_name,
+            "Subject": subject,
+            "Exchange Received Time": rec,
+            "Exchange Dissemination Time": dis,
+            "Time Taken": taken,
+            "Attachment Size": re.sub(r"\s*PDF\s*", "", texts[idx_attach], flags=re.I).strip() if _in_range(idx_attach, tds) else None,
+            "Attachment Link": " | ".join(pdf_links) if pdf_links else "",
+            "XBRL Link": " | ".join(xbrl_links) if xbrl_links else "",
+            "Has XBRL": bool(xbrl_links),
+
+            # parsed XBRL fields (filled later if available)
+            "XBRL NSE Symbol": "",
+            "XBRL Company Name": "",
+            "XBRL Subject": "",
+            "XBRL Description": "",
+            "XBRL Attachment URL": "",
+            "XBRL DateTime": "",
+            "XBRL Category": "",
+            "XBRL Parse Status": "no_xbrl" if not xbrl_links else "skipped" if not xbrl_parse else "",
+        }
+
+        if xbrl_parse and xbrl_links:
+            primary = xbrl_links[0]
+            data, status = _fetch_and_parse_xbrl(primary, sess, debug=debug)
+            row["XBRL Parse Status"] = status
+            if data:
+                row.update({k: v for k, v in data.items() if v})
+                if not row["Subject"] and data.get("XBRL Subject"):
+                    row["Subject"] = data["XBRL Subject"]
+
+        out.append(row)
+
+    return pd.DataFrame(out)
+
+
+# ---------- command ----------
 class Command(BaseCommand):
-    help = "Scrape BSE stock tiles via Selenium-rendered DOM and export to Excel & JSON."
+    help = "Scrape NSE announcements → Database (cleans Subject; splits times; includes & parses XBRL)."
 
     def add_arguments(self, parser):
-        parser.add_argument(
-            "--scripcodes",
-            type=str,
-            required=True,
-            help="Comma-separated BSE scrip codes, e.g. 530549,500325,532540",
-        )
-        parser.add_argument(
-            "--out",
-            type=str,
-            default="bse_quotes.xlsx",
-            help="Path to output Excel file (default: bse_quotes.xlsx)",
-        )
-        parser.add_argument(
-            "--json-out",
-            type=str,
-            default="bse_quotes.json",
-            help="Path to output JSON file (default: bse_quotes.json)",
-        )
-        parser.add_argument(
-            "--jsonl-out",
-            type=str,
-            default="bse_quotes.jsonl",
-            help="Path to output JSONL file (default: bse_quotes.jsonl)",
-        )
-        parser.add_argument(
-            "--sleep",
-            type=float,
-            default=1.0,
-            help="Extra seconds to sleep after load before reading tiles (default: 1.0)",
-        )
-        parser.add_argument(
-            "--headful",
-            action="store_true",
-            help="Run Chrome in non-headless mode for debugging",
-        )
-        parser.add_argument(
-            "--delay",
-            type=float,
-            default=2.0,
-            help="Delay between scraping different stocks (default: 2.0 seconds)",
-        )
+        parser.add_argument("--max-rows", type=int, default=100)
+        parser.add_argument("--headless", action="store_true", default=False)
+        parser.add_argument("--pause", type=float, default=1.2)
+        parser.add_argument("--stall", type=int, default=4)
+        parser.add_argument("--debug", action="store_true")
+        parser.add_argument("--xbrl-parse", dest="xbrl_parse", action="store_true", default=True)
+        parser.add_argument("--no-xbrl-parse", dest="xbrl_parse", action="store_false")
 
-    def handle(self, *args, **options):
-        raw_codes = options["scripcodes"]
-        xlsx_path = options["out"]
-        json_path = options["json_out"]
-        jsonl_path = options["jsonl_out"]
-        post_sleep = float(options["sleep"])
-        headful = bool(options["headful"])
-        delay = float(options["delay"])
+    def handle(self, *args, **opts):
+        max_rows  = int(opts["max_rows"])
+        headless  = bool(opts["headless"])
+        pause     = float(opts["pause"])
+        stall     = int(opts["stall"])
+        debug     = bool(opts.get("debug"))
+        xbrl_parse = bool(opts.get("xbrl_parse"))
 
-        scripcodes = [c.strip() for c in raw_codes.split(",") if c.strip()]
-        if not scripcodes:
-            raise CommandError("Provide at least one scripcode via --scripcodes")
+        self.stdout.write(f"→ Launching Chrome (headless={headless})")
+        driver = None
+        try:
+            driver = _setup_driver(headless=headless)
+        except Exception as e:
+            raise CommandError(f"Failed to launch Chrome/Driver: {e}")
 
-        # Validate scrip codes (basic check - should be numeric)
-        for code in scripcodes:
-            if not code.isdigit():
-                self.stdout.write(self.style.WARNING(f"Warning: '{code}' doesn't look like a valid BSE scrip code"))
+        df = pd.DataFrame()
+        try:
+            self.stdout.write("→ Opening NSE homepage (cookie preflight)")
+            driver.get(HOMEPAGE)
+            WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
-        rows: List[Dict[str, Optional[str]]] = []
+            self.stdout.write("→ Opening announcements page")
+            driver.get(URL)
+            _wait_table(driver, 30)
 
-        self.stdout.write(self.style.NOTICE(f"Starting Selenium scrape for {len(scripcodes)} scripcode(s)…"))
+            # build HTTP session with current NSE cookies
+            sess = _session_from_driver(driver)
 
-        with BSEQuoteScraper(headless=not headful, page_timeout=30) as scraper:
-            for i, code in enumerate(scripcodes):
+            _load_enough_rows(driver, max_rows=max_rows, pause=pause, stall_tolerance=stall)
+            df = _extract_table_html(driver, max_rows=max_rows, debug=debug, xbrl_parse=xbrl_parse, http_sess=sess)
+
+        finally:
+            if driver:
                 try:
-                    self.stdout.write(f"  → {code} … ({i+1}/{len(scripcodes)})")
-                    row = scraper.scrape_scripcode(code, post_load_sleep=post_sleep)
-                    rows.append(row)
-                    self.stdout.write(self.style.SUCCESS(f"    OK {code}"))
-                    
-                    if i < len(scripcodes) - 1:
-                        time.sleep(delay)
-                        
-                except Exception as e:
-                    self.stderr.write(self.style.ERROR(f"    FAIL {code}: {e}"))
-                    # Do not create an 'error' field; just record minimal row
-                    rows.append({
-                        "scripcode": code,
-                        "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
+                    driver.quit()
+                except Exception:
+                    pass
 
-        if not rows:
-            raise CommandError("No rows scraped; aborting.")
+        if df.empty:
+            self.stdout.write(self.style.WARNING("❌ No announcements scraped"))
+            return
 
-        # ----- Build DataFrame with stable schema -----
-        priority_cols = [
-            "scraped_at",
-            "scripcode",
-            "as_of",
+        # ------------------------------
+        # Save to Database
+        # ------------------------------
+        def _none_if_blank(v):
+            if v is None:
+                return None
+            if isinstance(v, float) and pd.isna(v):
+                return None
+            if isinstance(v, str) and not v.strip():
+                return None
+            return v
 
-            # Prices
-            "LTP",
-            "Change",
-            "ChangeAbs",
-            "ChangePct",
-            "Prev Close",
-            "Open",
-            "High",
-            "Low",
-            "VWAP",
+        count_new, count_existing = 0, 0
+        for _, row in df.iterrows():
+            unique_key = {
+                "symbol": _none_if_blank(row.get("Symbol")),
+                "subject": _none_if_blank(row.get("Subject")),
+                "exchange_dissemination_time": _none_if_blank(row.get("Exchange Dissemination Time")),
+            }
+            defaults = {
+                "company_name": _none_if_blank(row.get("Company Name")),
+                "exchange_received_time": _none_if_blank(row.get("Exchange Received Time")),
+                "time_taken": _none_if_blank(row.get("Time Taken")),
+                "attachment_size": _none_if_blank(row.get("Attachment Size")),
+                "attachment_link": _none_if_blank(row.get("Attachment Link")),
+                "xbrl_link": _none_if_blank(row.get("XBRL Link")),
+                "has_xbrl": bool(row.get("Has XBRL")),
+                "xbrl_nse_symbol": _none_if_blank(row.get("XBRL NSE Symbol")),
+                "xbrl_company_name": _none_if_blank(row.get("XBRL Company Name")),
+                "xbrl_subject": _none_if_blank(row.get("XBRL Subject")),
+                "xbrl_description": _none_if_blank(row.get("XBRL Description")),
+                "xbrl_attachment_url": _none_if_blank(row.get("XBRL Attachment URL")),
+                "xbrl_datetime": _none_if_blank(row.get("XBRL DateTime")),
+                "xbrl_category": _none_if_blank(row.get("XBRL Category")),
+                "xbrl_parse_status": _none_if_blank(row.get("XBRL Parse Status")),
+            }
 
-            # 52W / Bands
-            "52W High",
-            "52W Low",
-            "Upper Price Band",
-            "Lower Price Band",
+            with transaction.atomic():
+                obj, created = NseAnnouncement.objects.update_or_create(
+                    **unique_key,
+                    defaults=defaults
+                )
+            if created:
+                count_new += 1
+            else:
+                count_existing += 1
 
-            # Vol / Value
-            "TTQ",
-            "Turnover (Lakh)",
-            "Avg Qty 2W",
-
-            # Market Cap
-            "Mcap Full (Cr.)",
-            "Mcap FF (Cr.)",
-
-            # Fundamentals
-            "EPS (TTM)",
-            "CEPS (TTM)",
-            "PE",
-            "PB",
-            "ROE",
-            "Face Value",
-
-            # Classification
-            "Category",
-            "Group",
-            "Index",
-            "Macro Economic Indicator",
-            "Sector",
-            "Industry",
-            "Basic Industry",
-        ]
-
-        df = pd.DataFrame(rows)
-
-        # Canonicalize known alternates before ordering
-        for alias, canonical in LABEL_ALIASES.items():
-            if alias in df.columns and canonical not in df.columns:
-                df[canonical] = df[alias]
-
-        # Ensure all priority columns exist
-        for col in priority_cols:
-            if col not in df.columns:
-                df[col] = None
-
-        # --- create exact hyphenated label for outputs ---
-        if "Macro-Economic Indicator" not in df.columns:
-            df["Macro-Economic Indicator"] = df["Macro Economic Indicator"]
-
-        # Drop unwanted columns if they somehow appeared
-        drop_cols = ["company_name", "ISIN", "Security Code", "Security Id", "error"]
-        for c in drop_cols:
-            if c in df.columns:
-                df = df.drop(columns=[c])
-
-        # Reorder: priority first, then extras
-        extra_cols = [c for c in df.columns if c not in priority_cols and c != "Macro-Economic Indicator"]
-        ordered = priority_cols.copy()
-        insert_after = ordered.index("Macro Economic Indicator") + 1
-        ordered.insert(insert_after, "Macro-Economic Indicator")
-        df = df[[c for c in ordered if c in df.columns] + [c for c in extra_cols if c not in ordered]]
-
-        # ----- Write Excel -----
-        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Quotes", freeze_panes=(1, 0))
-        self.stdout.write(self.style.SUCCESS(f"Excel saved → {xlsx_path}"))
-
-        # ----- Write JSON & JSONL -----
-        json_records = json.loads(df.to_json(orient="records", date_format="iso"))
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(json_records, f, ensure_ascii=False, indent=2)
-        self.stdout.write(self.style.SUCCESS(f"JSON saved  → {json_path}"))
-
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for rec in json_records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self.stdout.write(self.style.SUCCESS(f"JSONL saved → {jsonl_path}"))
-
-        # Preview first record (if any)
-        if json_records:
-            preview = json.dumps(json_records[0], ensure_ascii=False, indent=2)
-            self.stdout.write(self.style.HTTP_INFO("Sample successful row:"))
-            self.stdout.write(preview)
-        else:
-            self.stdout.write(self.style.WARNING("No successful records to preview"))
-   
+        self.stdout.write(self.style.SUCCESS(
+            f"✅ {count_new} new NSE records inserted, {count_existing} already existed"
+        ))

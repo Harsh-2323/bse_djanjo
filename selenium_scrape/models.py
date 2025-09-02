@@ -137,6 +137,60 @@ class CorporateAction(models.Model):
         super().save(*args, **kwargs)
 
 
+# NEW MODEL: Consolidated BSE Announcements (similar to CorporateAction)
+class BseAnnouncementAggregate(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    
+    # Company details
+    company_name = models.CharField(max_length=255, null=True, blank=True)
+    bse_code = models.CharField(max_length=20, null=True, blank=True, db_index=True)
+    
+    # Consolidated announcements data (JSON field)
+    announcements_data = models.JSONField(null=True, blank=True, help_text="JSON array of all announcements for this company")
+    
+    # Date range for this scrape
+    scrape_start_date = models.CharField(max_length=20, null=True, blank=True, help_text="Start date in DD-MM-YYYY format")
+    scrape_end_date = models.CharField(max_length=20, null=True, blank=True, help_text="End date in DD-MM-YYYY format")
+    
+    # PDF storage tracking (JSON field containing list of PDF info)
+    pdfs_data = models.JSONField(null=True, blank=True, help_text="JSON array of PDF storage information")
+    
+    # Metadata
+    total_announcements_count = models.IntegerField(default=0, help_text="Number of announcements in this record")
+    total_pdfs_count = models.IntegerField(default=0, help_text="Number of PDFs stored in cloud")
+    last_scraped = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = "bse_announcements_aggregate"
+        ordering = ["-last_scraped"]
+        indexes = [
+            models.Index(fields=["bse_code"]),
+            models.Index(fields=["company_name"]),
+            models.Index(fields=["last_scraped"]),
+            models.Index(fields=["scrape_start_date", "scrape_end_date"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bse_code", "scrape_start_date", "scrape_end_date"],
+                name="uniq_bse_ann_code_dates",
+            )
+        ]
+    
+    def __str__(self):
+        return f"{self.company_name or 'Unknown'} ({self.bse_code or 'No BSE Code'}) - {self.total_announcements_count} announcements"
+    
+    def save(self, *args, **kwargs):
+        # Auto-calculate counts when saving
+        if self.announcements_data and isinstance(self.announcements_data, list):
+            self.total_announcements_count = len(self.announcements_data)
+        
+        if self.pdfs_data and isinstance(self.pdfs_data, list):
+            self.total_pdfs_count = len(self.pdfs_data)
+        
+        super().save(*args, **kwargs)
+
+
 class BseStockQuote(models.Model):
     id = models.BigAutoField(primary_key=True)
     
