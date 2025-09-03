@@ -238,3 +238,37 @@ class BseStockQuote(models.Model):
     def is_complete(self):
         """Check if all required fields are populated"""
         return bool(self.security_name and self.basic_industry)
+    
+
+from django.db import models
+
+
+class NseStockQuote(models.Model):
+    id = models.BigAutoField(primary_key=True)
+
+    # Core fields
+    symbol = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    company_name = models.CharField(max_length=255, null=True, blank=True)
+    basic_industry = models.CharField(max_length=255, null=True, blank=True)
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "nse_stock_quotes"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["symbol"]),
+            models.Index(fields=["company_name"]),
+            models.Index(fields=["basic_industry"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["symbol"],
+                name="uniq_nse_stock_symbol",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.company_name or 'Unknown'} ({self.symbol or 'No Symbol'}) - {self.basic_industry or 'No Industry'}"
