@@ -11,7 +11,7 @@ from django.db import IntegrityError, transaction
 # ⬇️ CHANGE THIS IMPORT to your app path
 from selenium_scrape.models import NseStockQuote
 
-import requests  # NEW
+import requests
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -140,7 +140,6 @@ class Command(BaseCommand):
                 if debug:
                     self.stdout.write(self.style.WARNING(f"[Attempt {attempt}] Warm-up {base}"))
 
-                # Warm up to seed cookies / tokens
                 driver.get(base)
                 self._wait_ready(driver, timeout)
 
@@ -150,15 +149,14 @@ class Command(BaseCommand):
                 driver.get(url)
                 self._wait_ready(driver, timeout)
 
-                # Wait until we have at least a non-empty title or an h1
                 WebDriverWait(driver, timeout).until(
                     lambda d: (d.title and d.title.strip()) or d.find_elements(By.TAG_NAME, "h1")
                 )
 
-                # Try to read company name from DOM/meta/title
+                # Try to read company name
                 name = self._extract_company_name(driver, timeout, debug)
 
-                # Make sure the Securities Information table exists and is hydrated
+                # Make sure the Securities Information table exists
                 WebDriverWait(driver, timeout).until(
                     EC.presence_of_element_located((By.ID, "securities_info_table"))
                 )
@@ -176,14 +174,13 @@ class Command(BaseCommand):
                     debug=debug,
                 )
 
-                # If the DOM/meta/title approach failed, fall back to the JSON API with cookies
+                # If DOM methods failed, fallback to API
                 if (not name) or (name == "Not Found"):
                     if debug:
-                        self.stdout.write(self.style.WARNING("Falling back to NSE API for company name..."))
+                        self.stdout.write(self.style.WARNING("⚠ Falling back to NSE API for company name..."))
                     api_name, api_industry = self._fetch_company_via_api(driver, symbol, debug=debug)
                     if api_name:
                         name = api_name
-                    # If basic industry was missing, fill from API too (when available)
                     if (not basic_industry or basic_industry == "Not Found") and api_industry:
                         basic_industry = api_industry
 
@@ -215,12 +212,11 @@ class Command(BaseCommand):
         self, driver: webdriver.Chrome, timeout: int, debug: bool
     ) -> Optional[str]:
         """
-        Robustly resolve the company name from various locations:
-        1) Header <h1> (and some common fallbacks)
+        Resolve company name via:
+        1) <h1>
         2) <meta property="og:title">
-        3) document.title pattern: "<SYMBOL> | <Company Name> share Price - NSE India"
+        3) document.title
         """
-        # 1) Primary: <h1> variants
         header_xpaths = [
             "//h1",
             "//div[contains(@class,'company-name')]//h1",
@@ -235,38 +231,43 @@ class Command(BaseCommand):
                 )
                 txt = (el.text or "").strip()
                 if txt:
+                    if debug:
+                        self.stdout.write(self.style.WARNING(
+                            f"✔ Company name found via H1 selector: {xp} → {txt}"
+                        ))
                     return txt
             except TimeoutException:
                 continue
 
-        # 2) Meta og:title
         try:
             meta = driver.find_element(By.CSS_SELECTOR, "meta[property='og:title']")
             content = (meta.get_attribute("content") or "").strip()
             if content:
                 parsed = self._parse_company_from_title_like(content)
                 if parsed:
+                    if debug:
+                        self.stdout.write(self.style.WARNING(
+                            f"✔ Company name found via <meta og:title>: {parsed}"
+                        ))
                     return parsed
         except NoSuchElementException:
             pass
 
-        # 3) Fallback: document.title parsing
         title = (driver.title or "").strip()
         if title:
             parsed = self._parse_company_from_title_like(title)
             if parsed:
+                if debug:
+                    self.stdout.write(self.style.WARNING(
+                        f"✔ Company name parsed from document.title: {parsed}"
+                    ))
                 return parsed
 
         if debug:
-            self.stdout.write(self.style.WARNING("Company name not found via h1/meta/title."))
+            self.stdout.write(self.style.WARNING("✘ Company name NOT found via h1/meta/title."))
         return None
 
     def _parse_company_from_title_like(self, text: str) -> Optional[str]:
-        """
-        Given strings like:
-          "RUPA | Rupa & Company Ltd. share Price - NSE India"
-        extract "Rupa & Company Ltd."
-        """
         m = re.search(r"\|\s*(.*?)\s+(?:share|Share)\b", text)
         if m and m.group(1).strip():
             return m.group(1).strip()
@@ -279,20 +280,11 @@ class Command(BaseCommand):
         return None
 
     def _fetch_company_via_api(self, driver: webdriver.Chrome, symbol: str, debug: bool = False) -> tuple[Optional[str], Optional[str]]:
-        """
-        Use the browser's cookies to call NSE's JSON API:
-          GET https://www.nseindia.com/api/quote-equity?symbol=<SYMBOL>
-        Returns (company_name, basic_industry_from_api)
-        """
         api_url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-
-        # Move Selenium cookies into a requests session
         sess = requests.Session()
         for c in driver.get_cookies():
-            # some cookies are essential (like akamai/consent); set all we have
             sess.cookies.set(c.get("name"), c.get("value"), domain=c.get("domain"))
 
-        # headers matter for this endpoint
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -303,19 +295,22 @@ class Command(BaseCommand):
         try:
             r = sess.get(api_url, timeout=15)
             if debug:
-                self.stdout.write(self.style.WARNING(f"NSE API status: {r.status_code}"))
+                self.stdout.write(self.style.WARNING(f"API call status: {r.status_code}"))
             if r.status_code != 200:
                 return None, None
 
             data = r.json()
-            # Typical structure: { "info": { "companyName": "...", "industry": "..." }, ... }
             info = data.get("info") or {}
             company = (info.get("companyName") or "").strip() or None
             industry = (info.get("industry") or "").strip() or None
+            if debug:
+                self.stdout.write(self.style.WARNING(
+                    f"✔ API returned company={company}, industry={industry}"
+                ))
             return company, industry
         except Exception as e:
             if debug:
-                self.stdout.write(self.style.WARNING(f"NSE API error: {e}"))
+                self.stdout.write(self.style.WARNING(f"✘ NSE API error: {e}"))
             return None, None
 
     def _extract_table_value(
@@ -326,9 +321,6 @@ class Command(BaseCommand):
         timeout: int,
         debug: bool,
     ) -> Optional[str]:
-        """
-        Generic key→value extraction for a 2-column table.
-        """
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.ID, table_id))
         )
@@ -349,11 +341,16 @@ class Command(BaseCommand):
                 )
                 value = (cell.text or "").strip()
                 if value:
+                    if debug:
+                        self.stdout.write(self.style.WARNING(
+                            f"✔ '{row_key}' found via XPath: {xp} → {value}"
+                        ))
                     return value
             except TimeoutException:
                 continue
 
         if debug:
-            self.stdout.write(self.style.WARNING(f"Row '{row_key}' not found in table '{table_id}'."))
-
+            self.stdout.write(self.style.WARNING(
+                f"✘ Row '{row_key}' not found in table '{table_id}'."
+            ))
         return None
