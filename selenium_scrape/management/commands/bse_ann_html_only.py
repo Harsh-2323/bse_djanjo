@@ -31,7 +31,7 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET")
 R2_PUBLIC_BASEURL = os.getenv("R2_PUBLIC_BASEURL")
 R2_BASE_PATH = "bse_announcements"
 
-# Enhanced Category Mapping
+# Enhanced Category Mapping (kept but NOT used anymore for extraction)
 CATEGORY_MAPPING = {
     'agm': 'Annual General Meeting',
     'annual general meeting': 'Annual General Meeting',
@@ -124,6 +124,27 @@ def clean_text(text: str) -> str:
     
     return text
 
+# NEW: Extract attachment size (only addition)
+def extract_attachment_size(table) -> str:
+    """
+    Extracts the attachment size (as rendered on the page) from an announcement table.
+    Returns a string like '0.45 MB' or '460.80 KB'; empty string if not found.
+    Prefers MB over KB if both are present.
+    """
+    try:
+        text = table.get_text(" ", strip=True)
+        matches = re.findall(r'(\d+(?:\.\d{1,2})?)\s*(MB|KB)\b', text, flags=re.I)
+        if not matches:
+            return ""
+        sizes = [f"{val} {unit.upper()}" for (val, unit) in matches]
+        mb = next((s for s in sizes if s.endswith("MB")), None)
+        if mb:
+            return mb
+        kb = next((s for s in sizes if s.endswith("KB")), None)
+        return kb or ""
+    except Exception:
+        return ""
+
 def extract_company_details(newssub: str) -> Tuple[str, str]:
     """Extract company name and code from NEWSSUB field"""
     if not newssub:
@@ -144,7 +165,7 @@ def extract_company_details(newssub: str) -> Tuple[str, str]:
     return company_name, company_code
 
 def categorize_announcement(text: str) -> str:
-    """Intelligently categorize announcement based on content"""
+    """(Unused for category extraction now) Intelligently categorize announcement based on content"""
     if not text:
         return "General"
     
@@ -169,14 +190,16 @@ def categorize_announcement(text: str) -> str:
 
 def extract_announcement_data(table) -> Dict[str, str]:
     """
-    Enhanced extraction function with better field separation
+    Enhanced extraction function with raw headline preservation and EXACT category capture from site.
+    If category cell isn't present, set category to empty string (null-equivalent), NO fallback mapping.
     """
     data = {
         'headline': '',
         'announcement_text': '',
         'category': '',
         'company_name': '',
-        'company_code': ''
+        'company_code': '',
+        'attachment_size': ''  # NEW
     }
     
     try:
@@ -187,20 +210,57 @@ def extract_announcement_data(table) -> Dict[str, str]:
         if newssub:
             data['company_name'], data['company_code'] = extract_company_details(newssub)
         
-        # 2. Extract HEADLINE (Primary content)
+        # 2. Extract HEADLINE - Preserve raw text without modifications
+        headline_text = ""
+        
+        # Method 1: Try original approach first
         headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
         if headline_tag:
             headline_text = clean_text(headline_tag.get_text(strip=True))
-            
-            # Remove company info from headline if it exists
-            if data['company_name'] and headline_text.startswith(data['company_name']):
-                headline_text = headline_text[len(data['company_name']):].lstrip(' -')
-            
-            # Remove company code from headline
-            if data['company_code']:
-                headline_text = re.sub(fr'\b{data["company_code"]}\b\s*-?\s*', '', headline_text)
-            
-            data['headline'] = clean_text(headline_text)
+        
+        # Method 2: If original fails, try nested table approach
+        if not headline_text:
+            nested_tables = table.find_all("table")
+            for nested_table in nested_tables:
+                try:
+                    first_row = nested_table.find("tr")
+                    if first_row:
+                        first_cell = first_row.find("td")
+                        if first_cell:
+                            span_tag = first_cell.find("span")
+                            if span_tag:
+                                potential_headline = clean_text(span_tag.get_text(strip=True))
+                                if (potential_headline and 
+                                    len(potential_headline) > 10 and
+                                    not re.match(r'^\d{2}-\d{2}-\d{4}', potential_headline) and
+                                    not re.match(r'^\d{2}:\d{2}:\d{2}', potential_headline) and
+                                    'exchange' not in potential_headline.lower() and
+                                    'received' not in potential_headline.lower() and
+                                    'disseminated' not in potential_headline.lower()):
+                                    headline_text = potential_headline
+                                    break
+                except:
+                    continue
+        
+        # Method 3: Fallback - search all spans for meaningful content
+        if not headline_text:
+            all_spans = table.find_all("span")
+            for span in all_spans:
+                span_text = clean_text(span.get_text(strip=True))
+                if (span_text and 
+                    len(span_text) > 20 and
+                    not re.match(r'^\d{2}-\d{2}-\d{4}', span_text) and
+                    not re.match(r'^\d{2}:\d{2}:\d{2}', span_text) and
+                    'exchange' not in span_text.lower() and
+                    'received' not in span_text.lower() and
+                    'disseminated' not in span_text.lower() and
+                    'pdf' not in span_text.lower() and
+                    'view' not in span_text.lower()):
+                    headline_text = span_text
+                    break
+        
+        # Assign raw headline without cleaning company name or code
+        data['headline'] = headline_text
         
         # 3. Extract announcement content from UUID div
         uuid_regex = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
@@ -218,31 +278,35 @@ def extract_announcement_data(table) -> Dict[str, str]:
             # Fallback: use headline as announcement text
             data['announcement_text'] = data['headline']
         
-        # 4. Generate category based on content
-        content_for_categorization = f"{data['headline']} {data['announcement_text']}"
-        data['category'] = categorize_announcement(content_for_categorization)
-        
+        # 4. Extract CATEGORY — EXACT text from the site; no normalization, no fallback
+        try:
+            category_td = table.select_one("td.tdcolumngrey.ng-binding.ng-scope[ng-if*=\"cann.CATEGORYNAME\"]")
+            if category_td:
+                data['category'] = category_td.get_text(strip=True)
+            else:
+                data['category'] = ""
+        except Exception as e:
+            print(f"Error extracting category: {e}")
+            data['category'] = ""
+
         # 5. Ensure we have minimum required content
         if not data['announcement_text'] and not data['headline']:
-            # Last resort: try to extract from any meaningful text in the table
             all_text_elements = table.find_all(text=True)
             meaningful_texts = []
             
             for text in all_text_elements:
                 cleaned = clean_text(text)
                 if (len(cleaned) > 20 and 
-                    not re.match(r'^\d{2}-\d{2}-\d{4}', cleaned) and  # Not date
-                    not re.match(r'^\d{2}:\d{2}:\d{2}', cleaned) and  # Not time
+                    not re.match(r'^\d{2}-\d{2}-\d{4}', cleaned) and
+                    not re.match(r'^\d{2}:\d{2}:\d{2}', cleaned) and
                     'exchange' not in cleaned.lower() and
                     'pdf' not in cleaned.lower() and
                     'view' not in cleaned.lower()):
                     meaningful_texts.append(cleaned)
             
             if meaningful_texts:
-                # Use the longest meaningful text
                 data['announcement_text'] = max(meaningful_texts, key=len)
                 if not data['headline']:
-                    # Create headline from first 100 chars
                     data['headline'] = data['announcement_text'][:100] + "..." if len(data['announcement_text']) > 100 else data['announcement_text']
         
         # 6. Final cleanup and validation
@@ -251,21 +315,25 @@ def extract_announcement_data(table) -> Dict[str, str]:
         
         if data['category'] and len(data['category']) > 100:
             data['category'] = data['category'][:100]
-        
+
+        # 7. NEW: Attachment size extraction (kept minimal, no other behavior changed)
+        try:
+            data['attachment_size'] = extract_attachment_size(table)
+        except Exception:
+            data['attachment_size'] = ""
+    
     except Exception as e:
         print(f"Error in extract_announcement_data: {e}")
-        # Ensure we have some basic data even on error
         if not data['announcement_text'] and not data['headline']:
             data['announcement_text'] = "Error extracting announcement content"
             data['headline'] = "Error extracting headline"
-            data['category'] = "General"
+            data['category'] = ""
     
     return data
 
 def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[str]:
     """Fetch PDF from pdf_url and upload to Cloudflare R2, return the R2 public URL."""
     try:
-        # Initialize R2 client
         s3_client = boto3.client(
             "s3",
             aws_access_key_id=R2_ACCESS_KEY,
@@ -274,7 +342,6 @@ def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[
             config=Config(signature_version="s3v4")
         )
 
-        # Fetch PDF content
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": BSE_URL,
@@ -289,7 +356,6 @@ def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[
                 print(f"Invalid content type for {pdf_url}: {ctype}")
                 return None
 
-            # Upload to R2
             s3_client.upload_fileobj(
                 Fileobj=r.raw,
                 Bucket=R2_BUCKET_NAME,
@@ -297,7 +363,6 @@ def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[
                 ExtraArgs={"ContentType": "application/pdf"}
             )
 
-            # Construct public URL
             r2_url = f"{R2_PUBLIC_BASEURL}/{r2_path}"
             print(f"Successfully uploaded {pdf_url} to {r2_url}")
             return r2_url
@@ -318,7 +383,6 @@ def scrape_bse_announcements_enhanced(
     try:
         driver.get(BSE_URL)
 
-        # Wait for the Angular tables to appear
         WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
         )
@@ -328,20 +392,16 @@ def scrape_bse_announcements_enhanced(
             page_count += 1
             print(f"\n--- Processing Page {page_count} ---")
             
-            # Parse current page
             soup = BeautifulSoup(driver.page_source, "lxml")
             tables = soup.find_all("table", {"ng-repeat": "cann in CorpannData.Table"})
 
             for i, table in enumerate(tables):
                 try:
-                    # Extract all data using enhanced function
                     announcement_data = extract_announcement_data(table)
                     
-                    # Extract PDF link
                     pdf_tag = table.find("a", class_="tablebluelink", href=True)
                     pdf_link = urljoin(BSE_URL, pdf_tag["href"]) if pdf_tag else ""
 
-                    # Extract timestamps
                     all_rows = table.find_all("tr")
                     time_row_text = all_rows[-2].get_text(strip=True) if len(all_rows) >= 2 else ""
                     
@@ -359,16 +419,13 @@ def scrape_bse_announcements_enhanced(
                     disseminated_date = match_disseminated.group(1) if match_disseminated else ""
                     disseminated_time = match_disseminated.group(2) if match_disseminated else ""
 
-                    # Only process announcements for the target date
                     if disseminated_date != target_date:
                         continue
 
-                    # Skip if we don't have essential data
                     if not announcement_data['announcement_text'] and not announcement_data['headline']:
                         print(f"Skipping record {len(records)+1}: No content")
                         continue
 
-                    # Check for duplicate before processing PDF
                     unique_key = {
                         "company_code": announcement_data['company_code'],
                         "announcement_text": announcement_data['announcement_text'],
@@ -379,7 +436,6 @@ def scrape_bse_announcements_enhanced(
                         print(f"Skipping duplicate record for {announcement_data['company_name']}")
                         continue
 
-                    # Handle PDF upload
                     pdf_path_cloud = ""
                     pdf_r2_path = ""
                     if pdf_link:
@@ -390,13 +446,13 @@ def scrape_bse_announcements_enhanced(
                         pdf_r2_path = f"{R2_BASE_PATH}/{r2_filename}"
                         pdf_path_cloud = upload_pdf_to_r2(pdf_link, pdf_r2_path)
 
-                    # Enhanced debug output
                     print(f"\n📄 Record {len(records)+1} (Page {page_count}, Item {i+1}):")
                     print(f"   🏢 Company: {announcement_data['company_name']} ({announcement_data['company_code']})")
                     print(f"   📰 Headline: {announcement_data['headline'][:100]}{'...' if len(announcement_data['headline']) > 100 else ''}")
                     print(f"   📂 Category: {announcement_data['category']}")
                     print(f"   📝 Content: {announcement_data['announcement_text'][:80]}{'...' if len(announcement_data['announcement_text']) > 80 else ''}")
                     print(f"   🕐 Time: {disseminated_date} {disseminated_time}")
+                    print(f"   📎 Size: {announcement_data.get('attachment_size') or 'N/A'}")  # NEW
                     print("   " + "="*80)
 
                     records.append({
@@ -409,12 +465,12 @@ def scrape_bse_announcements_enhanced(
                         "Exchange Received Time": received_time,
                         "Exchange Disseminated Date": disseminated_date,
                         "Exchange Disseminated Time": disseminated_time,
+                        "Attachment Size": announcement_data.get("attachment_size", ""),  # NEW
                         "PDF Link (web)": pdf_link,
                         "PDF Path (cloud)": pdf_path_cloud,
                         "PDF R2 Path": pdf_r2_path,
                     })
 
-                    # Stop if limit is reached
                     if limit and len(records) >= limit:
                         print(f"\n✅ Reached limit of {limit} records")
                         return pd.DataFrame(records)
@@ -423,7 +479,6 @@ def scrape_bse_announcements_enhanced(
                     print(f"❌ Error parsing entry {len(records)+1}: {e}")
                     continue
 
-            # Check for and click the "Next" button
             try:
                 next_button = WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable((By.ID, "idnext"))
@@ -479,14 +534,12 @@ class Command(BaseCommand):
             )
         )
 
-        # Validate date format
         try:
             datetime.strptime(target_date, "%d-%m-%Y")
         except ValueError:
             self.stdout.write(self.style.ERROR("❌ Invalid date format. Use DD-MM-YYYY"))
             return
 
-        # Run enhanced scraper
         items = scrape_bse_announcements_enhanced(
             target_date=target_date,
             headless=not options["debug"],
@@ -497,7 +550,6 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("❌ No data scraped for the specified date"))
             return
 
-        # Display improved sample
         self.stdout.write("\n" + "="*100)
         self.stdout.write(self.style.SUCCESS("📊 ENHANCED DATA SAMPLE (First 3 records):"))
         self.stdout.write("="*100)
@@ -509,9 +561,9 @@ class Command(BaseCommand):
             self.stdout.write(f"   📂 Category: {row['Category']}")
             self.stdout.write(f"   📝 Content: {row['Announcement Text'][:100]}{'...' if len(str(row['Announcement Text'])) > 100 else ''}")
             self.stdout.write(f"   📅 Date: {row['Exchange Disseminated Date']} {row['Exchange Disseminated Time']}")
+            self.stdout.write(f"   📎 Size: {row.get('Attachment Size') or 'N/A'}")  # NEW
             self.stdout.write("   " + "-"*80)
 
-        # Save to database with transaction safety
         count_new, count_existing = 0, 0
 
         for _, row in items.iterrows():
@@ -522,19 +574,17 @@ class Command(BaseCommand):
                 "exchange_disseminated_time": row.get("Exchange Disseminated Time"),
             }
 
-            # Skip if record already exists
             if SeleniumAnnouncement.objects.filter(**unique_key).exists():
                 count_existing += 1
                 continue
 
-            # Create new record
             try:
                 with transaction.atomic():
                     SeleniumAnnouncement.objects.create(
                         company_name=row.get("Company Name") or None,
                         company_code=row.get("Company Code") or None,
                         headline=row.get("Headline") or None,
-                        category=row.get("Category") or None,
+                        category=row.get("Category") or None,  # exact site text or null-equivalent
                         announcement_text=row.get("Announcement Text") or None,
                         exchange_received_date=row.get("Exchange Received Date") or None,
                         exchange_received_time=row.get("Exchange Received Time") or None,
@@ -543,6 +593,7 @@ class Command(BaseCommand):
                         pdf_link_web=row.get("PDF Link (web)") or None,
                         pdf_path_cloud=row.get("PDF Path (cloud)") or None,
                         pdf_r2_path=row.get("PDF R2 Path") or None,
+                        attachment_size=row.get("Attachment Size") or None,  # NEW
                     )
                     count_new += 1
             except Exception as e:
@@ -551,11 +602,9 @@ class Command(BaseCommand):
                 )
                 continue
 
-            # Stop if limit is reached
             if limit and count_new >= limit:
                 break
 
-        # Final summary
         self.stdout.write("\n" + "="*100)
         self.stdout.write(
             self.style.SUCCESS(
