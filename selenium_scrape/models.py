@@ -24,6 +24,17 @@ class SeleniumAnnouncement(models.Model):
     pdf_path_cloud = models.TextField(null=True, blank=True)  # Stores R2 public URL
     pdf_r2_path = models.TextField(null=True, blank=True)    # Stores R2 object key (optional)
 
+    # New fields
+    attachment_size = models.CharField(max_length=50, null=True, blank=True)
+    xbrl_nse_symbol = models.CharField(max_length=40, null=True, blank=True)
+    xbrl_company_name = models.CharField(max_length=255, null=True, blank=True)
+    xbrl_subject = models.TextField(null=True, blank=True)
+    xbrl_description = models.TextField(null=True, blank=True)
+    xbrl_attachment_url = models.TextField(null=True, blank=True)
+    xbrl_datetime = models.CharField(max_length=40, null=True, blank=True)
+    xbrl_category = models.CharField(max_length=120, null=True, blank=True)
+    xbrl_parse_status = models.CharField(max_length=50, null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -38,6 +49,9 @@ class SeleniumAnnouncement(models.Model):
         txt = self.headline or self.announcement_text or ""
         return f"{self.company_name or ''} - {txt[:50]}"
 
+from django.db import models
+
+from django.db import models
 
 class NseAnnouncement(models.Model):
     id = models.BigAutoField(primary_key=True)
@@ -46,19 +60,27 @@ class NseAnnouncement(models.Model):
     symbol = models.CharField(max_length=20, null=True, blank=True, db_index=True)
     company_name = models.CharField(max_length=255, null=True, blank=True)
 
-    # Text / subject
+    # Text / subject / details
     subject = models.TextField(null=True, blank=True)
+    details = models.TextField(null=True, blank=True, help_text="Detailed announcement content")
 
-    # Timestamps
-    exchange_received_time = models.CharField(max_length=40, null=True, blank=True)
-    exchange_dissemination_time = models.CharField(max_length=40, null=True, blank=True)
-    time_taken = models.CharField(max_length=20, null=True, blank=True)
+    # Timestamps - separate date and time fields
+    exchange_received_date = models.CharField(max_length=20, null=True, blank=True)
+    exchange_received_time_only = models.CharField(max_length=20, null=True, blank=True)
+    exchange_disseminated_date = models.CharField(max_length=20, null=True, blank=True)
+    exchange_disseminated_time_only = models.CharField(max_length=20, null=True, blank=True)
 
     # Attachments
     attachment_size = models.CharField(max_length=50, null=True, blank=True)
     attachment_link = models.TextField(null=True, blank=True)   # may contain multiple PDFs
     xbrl_link = models.TextField(null=True, blank=True)         # may contain multiple XBRLs
     has_xbrl = models.BooleanField(default=False)
+
+    # PDF storage fields (added to match SeleniumAnnouncement)
+    pdf_link_web = models.TextField(null=True, blank=True, help_text="Web URL for the PDF")
+    pdf_path_local = models.TextField(null=True, blank=True, help_text="Local file path for the PDF")
+    pdf_path_cloud = models.TextField(null=True, blank=True, help_text="R2 public URL for the PDF")
+    pdf_r2_path = models.TextField(null=True, blank=True, help_text="R2 object key for the PDF")
 
     # XBRL parsed fields
     xbrl_nse_symbol = models.CharField(max_length=40, null=True, blank=True)
@@ -77,12 +99,16 @@ class NseAnnouncement(models.Model):
         db_table = "nse_announcements"
         ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["symbol", "exchange_dissemination_time"]),
+            models.Index(fields=["symbol", "exchange_disseminated_time_only"]),
             models.Index(fields=["xbrl_category"]),
+            models.Index(fields=["details"], name="idx_nse_ann_details"),
+            models.Index(fields=["exchange_received_date"], name="idx_nse_ann_recv_date"),
+            models.Index(fields=["exchange_disseminated_date"], name="idx_nse_ann_diss_date"),
+            models.Index(fields=["symbol", "exchange_disseminated_date"], name="idx_nse_ann_symbol_diss_date"),
         ]
         constraints = [
             models.UniqueConstraint(
-                fields=["symbol", "subject", "exchange_dissemination_time"],
+                fields=["symbol", "subject", "exchange_disseminated_time_only"],
                 name="uniq_nse_ann_symbol_subject_time",
             )
         ]
@@ -91,6 +117,25 @@ class NseAnnouncement(models.Model):
         txt = self.subject or self.xbrl_subject or ""
         return f"{self.symbol or self.company_name or ''} - {txt[:60]}"
 
+    def get_details_preview(self, max_length=200):
+        """Return a truncated version of details for display purposes."""
+        if not self.details:
+            return ""
+        if len(self.details) <= max_length:
+            return self.details
+        return self.details[:max_length].rsplit(' ', 1)[0] + "..."
+
+    def get_exchange_received_datetime(self):
+        """Combine separate date and time fields into a single datetime string."""
+        if self.exchange_received_date and self.exchange_received_time_only:
+            return f"{self.exchange_received_date} {self.exchange_received_time_only}"
+        return ""
+
+    def get_exchange_disseminated_datetime(self):
+        """Combine separate date and time fields into a single datetime string."""
+        if self.exchange_disseminated_date and self.exchange_disseminated_time_only:
+            return f"{self.exchange_disseminated_date} {self.exchange_disseminated_time_only}"
+        return ""
 
 class CorporateAction(models.Model):
     id = models.BigAutoField(primary_key=True)
@@ -272,3 +317,52 @@ class NseStockQuote(models.Model):
 
     def __str__(self):
         return f"{self.company_name or 'Unknown'} ({self.symbol or 'No Symbol'}) - {self.basic_industry or 'No Industry'}"
+    
+
+
+    from django.db import models
+
+class NSECorporateAction(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    
+    # Company details
+    symbol = models.CharField(max_length=50, unique=True, db_index=True, help_text="NSE stock symbol")
+    company_name = models.CharField(max_length=255, null=True, blank=True, help_text="Company name")
+    
+    # Corporate actions data (JSON field)
+    actions_data = models.JSONField(null=True, blank=True, help_text="JSON object with equity and sme corporate actions")
+    
+    # File storage details
+    json_r2_path = models.TextField(null=True, blank=True, help_text="R2 object key path for JSON file")
+    json_cloud_url = models.TextField(null=True, blank=True, help_text="R2 public URL for JSON file")
+    
+    # Metadata
+    total_actions_count = models.IntegerField(default=0, help_text="Total number of corporate actions (equity + sme)")
+    last_updated = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = "nse_corporate_actions"
+        ordering = ["-last_updated"]
+        indexes = [
+            models.Index(fields=["symbol"]),
+            models.Index(fields=["company_name"]),
+            models.Index(fields=["last_updated"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["symbol"],
+                name="uniq_nse_corp_action_symbol",
+            )
+        ]
+    
+    def __str__(self):
+        return f"{self.company_name or 'Unknown'} ({self.symbol or 'No Symbol'}) - {self.total_actions_count} actions"
+    
+    def save(self, *args, **kwargs):
+        # Auto-calculate total_actions_count when saving
+        if self.actions_data and isinstance(self.actions_data, dict):
+            equity_count = len(self.actions_data.get("equity", [])) if self.actions_data.get("equity") else 0
+            sme_count = len(self.actions_data.get("sme", [])) if self.actions_data.get("sme") else 0
+            self.total_actions_count = equity_count + sme_count
+        super().save(*args, **kwargs)

@@ -6,7 +6,6 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from pathlib import Path
 import re
 import time
 import os
@@ -23,7 +22,6 @@ from selenium_scrape.models import SeleniumAnnouncement
 
 # Constants
 BSE_URL = "https://www.bseindia.com/corporates/ann.html"
-DEFAULT_OUTPUT_XLSX = "outputs/BSE_Announcements_Output.xlsx"
 
 # Cloudflare R2 Configuration (from environment variables)
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
@@ -128,56 +126,64 @@ def _extract_category_from_table(table) -> str:
         pass
     return ""
 
-# -----------------------------
-# Excel writer
-# -----------------------------
-def save_to_excel_with_links(df: pd.DataFrame, out_path: str):
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="BSE")
-        ws = writer.sheets["BSE"]
-
-        cols = {name: idx for idx, name in enumerate(df.columns)}
-        web_col = cols.get("PDF Link (web)")
-        cloud_col = cols.get("PDF Path (cloud)")
-        r2_path_col = cols.get("PDF R2 Path")
-
-        for r in range(len(df)):
-            if web_col is not None:
-                web = df.iat[r, web_col]
-                if isinstance(web, str) and web.startswith("http"):
-                    ws.write_url(r + 1, web_col, web, string="Open PDF (web)")
-            if cloud_col is not None:
-                lp = df.iat[r, cloud_col]
-                if isinstance(lp, str) and lp.startswith("http"):
-                    ws.write_url(r + 1, cloud_col, lp, string="Open PDF (cloud)")
-            if r2_path_col is not None:
-                rp = df.iat[r, r2_path_col]
-                if isinstance(rp, str) and rp:
-                    ws.write_string(r + 1, r2_path_col, rp)
-
-        def _setcol(c, w):
-            if c is not None:
-                ws.set_column(c, c, w)
-
-        _setcol(cols.get("Headline"), 60)
-        _setcol(cols.get("Category"), 28)
-        ws.set_column(0, 0, 28)  # Company Name
-        ws.set_column(1, 1, 12)  # Company Code
-        ws.set_column(2, 2, 60)  # Announcement Text
-        ws.set_column(3, 6, 20)  # Dates/Times
-        _setcol(web_col, 22)
-        _setcol(cloud_col, 26)
-        _setcol(r2_path_col, 26)
+def extract_announcement_fields_from_table(driver, table):
+    """Extract headline and announcement text from the correct locations."""
+    headline = ""
+    announcement_text = ""
+    
+    try:
+        # Extract headline using the CSS selector pattern
+        headline_element = table.select_one("tr:nth-child(4) td table:nth-child(1) tr:nth-child(1) td:nth-child(1)")
+        if headline_element:
+            headline = headline_element.get_text(strip=True)
+        
+        # For announcement text, look for divs with UUID-like IDs
+        announcement_divs = table.find_all("div", id=True)
+        for div in announcement_divs:
+            div_id = div.get("id", "")
+            if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', div_id):
+                announcement_text = div.get_text(strip=True)
+                break
+        
+        # Fallback: try other potential containers
+        if not announcement_text:
+            for selector in [
+                "div[id*='-']",
+                ".announcement-text",
+                "td[colspan]",
+            ]:
+                element = table.select_one(selector)
+                if element:
+                    text = element.get_text(strip=True)
+                    if text and text != headline and len(text) > 10:
+                        announcement_text = text
+                        break
+        
+        # Fallback to original method
+        if not announcement_text:
+            headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
+            if headline_tag:
+                announcement_text = headline_tag.get_text(strip=True)
+    
+    except Exception as e:
+        print(f"Error extracting announcement fields: {e}")
+        try:
+            headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
+            if headline_tag:
+                headline = headline_tag.get_text(strip=True)
+                announcement_text = headline
+        except Exception:
+            pass
+    
+    return headline, announcement_text
 
 # -----------------------------
 # Core scrape
 # -----------------------------
 def scrape_bse_announcements_like_reference(
     target_date: str = "28-08-2025",
-    download_pdfs: bool = True,
     headless: bool = True,
+    limit: Optional[int] = None
 ) -> pd.DataFrame:
     driver = setup_driver(headless=headless)
     records: List[Dict] = []
@@ -197,11 +203,13 @@ def scrape_bse_announcements_like_reference(
             for table in tables:
                 try:
                     newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
-                    headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
                     pdf_tag = table.find("a", class_="tablebluelink", href=True)
 
                     newssub = (newssub_tag.get_text(strip=True) if newssub_tag else "") or ""
-                    headline = (headline_tag.get_text(strip=True) if headline_tag else "") or ""
+                    
+                    # Extract headline and announcement text
+                    headline, announcement_text = extract_announcement_fields_from_table(driver, table)
+                    
                     category = _extract_category_from_table(table)
                     pdf_link = urljoin(BSE_URL, pdf_tag["href"]) if pdf_tag else ""
 
@@ -233,7 +241,7 @@ def scrape_bse_announcements_like_reference(
                     # Check for duplicate before fetching/uploading PDF
                     unique_key = {
                         "company_code": company_code,
-                        "announcement_text": headline,
+                        "announcement_text": announcement_text,
                         "exchange_disseminated_date": disseminated_date,
                         "exchange_disseminated_time": disseminated_time,
                     }
@@ -242,7 +250,7 @@ def scrape_bse_announcements_like_reference(
 
                     pdf_path_cloud = ""
                     pdf_r2_path = ""
-                    if download_pdfs and pdf_link:
+                    if pdf_link:
                         code_for_name = company_code or (re.search(r"\d{6}", newssub).group() if re.search(r"\d{6}", newssub) else "NA")
                         date_compact = received_date.replace("-", "") if received_date else "NA"
                         r2_filename = f"{len(records)+1:03d}{code_for_name}{date_compact}_{safe_filename(headline)[:50]}.pdf"
@@ -256,7 +264,7 @@ def scrape_bse_announcements_like_reference(
                         "Category": category,
                         "Company Name": company_name,
                         "Company Code": company_code,
-                        "Announcement Text": headline,
+                        "Announcement Text": announcement_text,
                         "Exchange Received Date": received_date,
                         "Exchange Received Time": received_time,
                         "Exchange Disseminated Date": disseminated_date,
@@ -265,6 +273,11 @@ def scrape_bse_announcements_like_reference(
                         "PDF Path (cloud)": pdf_path_cloud,
                         "PDF R2 Path": pdf_r2_path,
                     })
+
+                    # Stop if limit is reached
+                    if limit and len(records) >= limit:
+                        return pd.DataFrame(records)
+
                 except Exception as e:
                     print(f"Error parsing entry {len(records)+1}: {e}")
 
@@ -305,10 +318,21 @@ class Command(BaseCommand):
             action="store_true",
             help="Enable debug output (show browser)"
         )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help="Limit the number of records to scrape (e.g., 10 for testing)",
+        )
 
     def handle(self, *args, **options):
         target_date = options["date"]
-        self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date}...")
+        limit = options.get("limit")
+        
+        if limit:
+            self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date} (LIMITED to {limit} records)...")
+        else:
+            self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date}...")
 
         # Validate date format
         try:
@@ -319,8 +343,8 @@ class Command(BaseCommand):
 
         items = scrape_bse_announcements_like_reference(
             target_date=target_date,
-            download_pdfs=True,
-            headless=not options["debug"]
+            headless=not options["debug"],
+            limit=limit
         )
 
         if items.empty:
@@ -366,16 +390,12 @@ class Command(BaseCommand):
                 )
                 count_new += 1
 
+            # Stop if limit is reached
+            if limit and count_new >= limit:
+                break
+
         self.stdout.write(
             self.style.SUCCESS(
                 f"✅ {count_new} new records inserted, {count_existing} already existed (skipped)"
             )
         )
-
-        # Save to Excel
-        if not items.empty:
-            output_path = f"outputs/BSE_Announcements_{target_date.replace('-', '')}.xlsx"
-            save_dir = Path(output_path).parent
-            save_dir.mkdir(parents=True, exist_ok=True)
-            save_to_excel_with_links(items, output_path)
-            self.stdout.write(self.style.SUCCESS(f"📊 Data saved to {output_path}"))

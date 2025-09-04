@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import time
-import glob
 import csv
 import json
-from pathlib import Path
+import boto3
+from datetime import datetime
+from io import StringIO
 from django.core.management.base import BaseCommand, CommandError
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -17,9 +18,10 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
+from selenium_scrape.models import NSECorporateAction, NseStockQuote, NseAnnouncement
 
 class Command(BaseCommand):
-    help = "Download NSE corporate actions CSVs for Equity and SME tabs, scrape them, and output as JSON."
+    help = "Scrape NSE corporate actions, save to DB, optionally scrape announcements, and upload JSON to R2 without local storage."
 
     def add_arguments(self, parser):
         parser.add_argument("symbol", type=str, help="Stock symbol, e.g., ASAHIINDIA")
@@ -27,9 +29,9 @@ class Command(BaseCommand):
         parser.add_argument("--retries", type=int, default=3, help="Page-level retries")
         parser.add_argument("--no-headless", action="store_true", help="Run Chrome with UI")
         parser.add_argument("--debug", action="store_true", help="Verbose logs including page source")
-        parser.add_argument("--download-dir", type=str, default="downloads", help="Directory to save downloads")
-        parser.add_argument("--equity-only", action="store_true", help="Download only equity CSV")
-        parser.add_argument("--sme-only", action="store_true", help="Download only SME CSV")
+        parser.add_argument("--equity-only", action="store_true", help="Scrape only equity data")
+        parser.add_argument("--sme-only", action="store_true", help="Scrape only SME data")
+        parser.add_argument("--scrape-announcements", action="store_true", help="Scrape announcements and save to NseAnnouncement")
 
     def handle(self, *args, **options):
         symbol = options["symbol"].upper().strip()
@@ -37,20 +39,14 @@ class Command(BaseCommand):
         retries: int = options["retries"]
         headless: bool = not options["no_headless"]
         debug: bool = options["debug"]
-        download_dir: str = options["download_dir"]
         equity_only: bool = options["equity_only"]
         sme_only: bool = options["sme_only"]
+        scrape_announcements: bool = options["scrape_announcements"]
 
         if not symbol:
             raise CommandError("Symbol must be a non-empty string.")
 
-        # Create download directory
-        os.makedirs(download_dir, exist_ok=True)
-        
-        # Clear any existing CSV and JSON files to avoid confusion
-        self._clear_existing_files(download_dir, debug, ["*.csv", "*.json"])
-
-        chrome_options = self._build_chrome_options(headless=headless, download_dir=os.path.abspath(download_dir))
+        chrome_options = self._build_chrome_options(headless=headless)
 
         try:
             driver = webdriver.Chrome(options=chrome_options)
@@ -58,71 +54,116 @@ class Command(BaseCommand):
             raise CommandError(f"Could not start Chrome driver: {e}") from e
 
         try:
-            equity_csv, sme_csv = self._download_csv_with_retries(
+            # Get company name from NseStockQuote or scrape from website
+            company_name = self._get_company_name(driver, symbol, timeout, debug)
+
+            # Scrape corporate actions tables
+            equity_data, sme_data = self._scrape_corporate_actions(
                 driver=driver,
                 symbol=symbol,
                 timeout=timeout,
                 retries=retries,
                 debug=debug,
-                download_dir=download_dir,
                 equity_only=equity_only,
                 sme_only=sme_only,
             )
             
-            # Scrape CSVs and convert to JSON
+            # Prepare JSON output
             json_output = {
                 "symbol": symbol,
-                "equity": None,
-                "sme": None
+                "equity": equity_data,
+                "sme": sme_data
             }
             
-            if equity_csv and not sme_only:
-                try:
-                    json_output["equity"] = self._parse_csv(equity_csv, debug)
-                    self.stdout.write(self.style.SUCCESS(f"Equity CSV parsed for {symbol}: {equity_csv}"))
-                except Exception as e:
-                    self.stdout.write(self.style.ERROR(f"Failed to parse Equity CSV {equity_csv}: {e}"))
+            # Save corporate actions to NSECorporateAction
+            try:
+                nse_corp_action, created = NSECorporateAction.objects.get_or_create(
+                    symbol=symbol,
+                    defaults={"company_name": company_name or symbol}
+                )
+                nse_corp_action.actions_data = json_output
+                nse_corp_action.save()
+                self.stdout.write(self.style.SUCCESS(
+                    f"{'Created' if created else 'Updated'} NSECorporateAction for {symbol} with {nse_corp_action.total_actions_count} actions"
+                ))
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f"Failed to save to NSECorporateAction for {symbol}: {e}"))
+
+            # Upload JSON to R2
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            json_filename = f"{symbol}_{timestamp}.json"
+            r2_key = f"nse/{symbol}/{json_filename}"
+            r2_public_url = f"{os.getenv('R2_PUBLIC_BASEURL')}/{r2_key}"
             
-            if sme_csv and not equity_only:
-                try:
-                    json_output["sme"] = self._parse_csv(sme_csv, debug)
-                    self.stdout.write(self.style.SUCCESS(f"SME CSV parsed for {symbol}: {sme_csv}"))
-                except Exception as e:
-                    self.stdout.write(self.style.ERROR(f"Failed to parse SME CSV {sme_csv}: {e}"))
-            
+            try:
+                s3_client = boto3.client(
+                    "s3",
+                    endpoint_url=os.getenv("R2_ENDPOINT"),
+                    aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY")
+                )
+                json_buffer = StringIO()
+                json.dump(json_output, json_buffer, indent=2, ensure_ascii=False)
+                json_buffer.seek(0)
+                s3_client.upload_fileobj(
+                    Fileobj=json_buffer,
+                    Bucket=os.getenv("R2_BUCKET"),
+                    Key=r2_key,
+                    ExtraArgs={"ContentType": "application/json"}
+                )
+                self.stdout.write(self.style.SUCCESS(f"Uploaded JSON to R2: {r2_key}"))
+                
+                # Update NSECorporateAction with R2 paths
+                nse_corp_action.json_r2_path = r2_key
+                nse_corp_action.json_cloud_url = r2_public_url
+                nse_corp_action.save()
+                self.stdout.write(self.style.SUCCESS(f"Updated NSECorporateAction with R2 path: {r2_key}"))
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f"Failed to upload JSON to R2 for {symbol}: {e}"))
+
+            # Scrape announcements if requested
+            if scrape_announcements:
+                announcements = self._scrape_announcements(driver, symbol, timeout, debug)
+                for ann in announcements:
+                    try:
+                        NseAnnouncement.objects.get_or_create(
+                            symbol=symbol,
+                            subject=ann.get("subject"),
+                            exchange_dissemination_time=ann.get("exchange_dissemination_time"),
+                            defaults={
+                                "company_name": company_name or symbol,
+                                "exchange_received_time": ann.get("exchange_received_time"),
+                                "time_taken": ann.get("time_taken"),
+                                "attachment_size": ann.get("attachment_size"),
+                                "attachment_link": ann.get("attachment_link"),
+                                "xbrl_link": ann.get("xbrl_link"),
+                                "has_xbrl": bool(ann.get("xbrl_link"))
+                            }
+                        )
+                        self.stdout.write(self.style.SUCCESS(f"Saved announcement for {symbol}: {ann.get('subject')[:60]}"))
+                    except Exception as e:
+                        self.stdout.write(self.style.ERROR(f"Failed to save announcement for {symbol}: {e}"))
+
             # Output JSON to console
             json_string = json.dumps(json_output, indent=2, ensure_ascii=False)
             self.stdout.write(self.style.SUCCESS(f"JSON output for {symbol}:\n{json_string}"))
-            
-            # Save JSON to files
-            if equity_csv and not sme_only:
-                equity_json_path = os.path.join(download_dir, f"{symbol}_equity.json")
-                with open(equity_json_path, "w", encoding="utf-8") as f:
-                    json.dump({"symbol": symbol, "equity": json_output["equity"]}, f, indent=2, ensure_ascii=False)
-                self.stdout.write(self.style.SUCCESS(f"Equity JSON saved to: {equity_json_path}"))
-            
-            if sme_csv and not equity_only:
-                sme_json_path = os.path.join(download_dir, f"{symbol}_sme.json")
-                with open(sme_json_path, "w", encoding="utf-8") as f:
-                    json.dump({"symbol": symbol, "sme": json_output["sme"]}, f, indent=2, ensure_ascii=False)
-                self.stdout.write(self.style.SUCCESS(f"SME JSON saved to: {sme_json_path}"))
-            
-            # Report download status
+
+            # Report scrape status
             success_count = 0
-            if equity_csv and not sme_only:
-                self.stdout.write(self.style.SUCCESS(f"Equity CSV downloaded for {symbol}: {equity_csv}"))
+            if equity_data and not sme_only:
+                self.stdout.write(self.style.SUCCESS(f"Equity data scraped for {symbol}: {len(equity_data)} rows"))
                 success_count += 1
-            if sme_csv and not equity_only:
-                self.stdout.write(self.style.SUCCESS(f"SME CSV downloaded for {symbol}: {sme_csv}"))
+            if sme_data and not equity_only:
+                self.stdout.write(self.style.SUCCESS(f"SME data scraped for {symbol}: {len(sme_data)} rows"))
                 success_count += 1
                 
-            if success_count == 0:
-                raise CommandError(f"Failed to download any CSV for symbol: {symbol}")
+            if success_count == 0 and not scrape_announcements:
+                raise CommandError(f"Failed to scrape any data for symbol: {symbol}")
                 
-            if not equity_csv and not sme_only:
-                self.stdout.write(self.style.WARNING(f"No Equity CSV downloaded for {symbol}"))
-            if not sme_csv and not equity_only:
-                self.stdout.write(self.style.WARNING(f"No SME CSV downloaded for {symbol}. May not have SME data."))
+            if not equity_data and not sme_only:
+                self.stdout.write(self.style.WARNING(f"No Equity data scraped for {symbol}"))
+            if not sme_data and not equity_only:
+                self.stdout.write(self.style.WARNING(f"No SME data scraped for {symbol}. May not have SME data."))
 
         finally:
             try:
@@ -130,77 +171,102 @@ class Command(BaseCommand):
             except Exception:
                 pass
 
-    def _clear_existing_files(self, download_dir: str, debug: bool, patterns: list[str]):
-        """Clear existing files matching patterns to avoid confusion during download detection"""
-        for pattern in patterns:
-            files = glob.glob(os.path.join(download_dir, pattern))
-            for file in files:
-                try:
-                    os.remove(file)
-                    if debug:
-                        self.stdout.write(self.style.WARNING(f"Removed existing file: {file}"))
-                except OSError:
-                    pass
-
-    def _build_chrome_options(self, headless: bool, download_dir: str) -> Options:
-        opts = Options()
-        if headless:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        )
-        opts.add_experimental_option("prefs", {
-            "download.default_directory": download_dir,
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": True,
-        })
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument("--lang=en-US,en;q=0.9")
-        return opts
-
-    def _parse_csv(self, csv_path: str, debug: bool) -> list[dict]:
-        """Parse a CSV file into a list of dictionaries"""
-        if debug:
-            self.stdout.write(self.style.WARNING(f"Parsing CSV: {csv_path}"))
-        
+    def _get_company_name(self, driver: webdriver.Chrome, symbol: str, timeout: int, debug: bool) -> str | None:
+        """Get company name from NseStockQuote or scrape from NSE website"""
         try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                if not reader.fieldnames:
-                    self.stdout.write(self.style.WARNING(f"CSV file {csv_path} is empty or has no headers"))
-                    return []
-                
-                data = [row for row in reader]
+            stock_quote = NseStockQuote.objects.filter(symbol=symbol).first()
+            if stock_quote and stock_quote.company_name:
                 if debug:
-                    self.stdout.write(self.style.SUCCESS(f"Parsed {len(data)} rows from {csv_path}"))
-                return data
+                    self.stdout.write(self.style.SUCCESS(f"Found company name in NseStockQuote: {stock_quote.company_name}"))
+                return stock_quote.company_name
         except Exception as e:
-            self.stdout.write(self.style.ERROR(f"Error parsing CSV {csv_path}: {e}"))
-            return []
+            self.stdout.write(self.style.WARNING(f"Error checking NseStockQuote for {symbol}: {e}"))
 
-    def _download_csv_with_retries(
+        # Scrape company name from NSE website
+        try:
+            url = f"https://www.nseindia.com/companies-listing/corporate-filings-actions?symbol={symbol}&tabIndex=equity"
+            driver.get(url)
+            self._wait_ready(driver, timeout, debug)
+            company_name_element = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "h2#companyName, h1"))
+            )
+            company_name = company_name_element.text.strip()
+            if debug:
+                self.stdout.write(self.style.SUCCESS(f"Scraped company name: {company_name}"))
+            return company_name
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"Failed to scrape company name for {symbol}: {e}"))
+            return None
+
+    def _scrape_announcements(self, driver: webdriver.Chrome, symbol: str, timeout: int, debug: bool) -> list[dict]:
+        """Scrape announcements from NSE website"""
+        announcements = []
+        try:
+            url = f"https://www.nseindia.com/companies-listing/corporate-filings-announcements?symbol={symbol}"
+            driver.get(url)
+            self._wait_ready(driver, timeout, debug)
+            
+            if debug:
+                self.stdout.write(self.style.WARNING(f"Scraping announcements for {symbol} from {url}"))
+            
+            # Wait for announcement table
+            table = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.ID, "CFannouncements"))
+            )
+            
+            # Find rows in the announcements table
+            rows = table.find_elements(By.TAG_NAME, "tr")[1:]  # Skip header
+            for row in rows:
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if len(cells) >= 5:
+                        announcement = {
+                            "subject": cells[0].text.strip(),
+                            "exchange_received_time": cells[1].text.strip(),
+                            "exchange_dissemination_time": cells[2].text.strip(),
+                            "time_taken": cells[3].text.strip(),
+                            "attachment_size": cells[4].text.strip(),
+                            "attachment_link": None,
+                            "xbrl_link": None
+                        }
+                        # Get attachment links
+                        try:
+                            links = cells[4].find_elements(By.TAG_NAME, "a")
+                            for link in links:
+                                href = link.get_attribute("href")
+                                if href and ".pdf" in href.lower():
+                                    announcement["attachment_link"] = href
+                                elif href and ".xbrl" in href.lower():
+                                    announcement["xbrl_link"] = href
+                        except:
+                            pass
+                        announcements.append(announcement)
+                except Exception as e:
+                    self.stdout.write(self.style.WARNING(f"Error parsing announcement row: {e}"))
+            
+            if debug:
+                self.stdout.write(self.style.SUCCESS(f"Scraped {len(announcements)} announcements for {symbol}"))
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f"Failed to scrape announcements for {symbol}: {e}"))
+        return announcements
+
+    def _scrape_corporate_actions(
         self,
         driver: webdriver.Chrome,
         symbol: str,
         timeout: int,
         retries: int,
         debug: bool,
-        download_dir: str,
         equity_only: bool = False,
         sme_only: bool = False,
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[list[dict] | None, list[dict] | None]:
+        """Scrape corporate actions tables for Equity and/or SME tabs"""
         base = "https://www.nseindia.com/"
-        equity_csv = None
-        sme_csv = None
+        equity_data = None
+        sme_data = None
         
         if debug:
-            self.stdout.write(self.style.WARNING(f"Starting download process for {symbol}"))
+            self.stdout.write(self.style.WARNING(f"Starting scrape process for {symbol}"))
 
         for attempt in range(1, retries + 1):
             try:
@@ -210,50 +276,45 @@ class Command(BaseCommand):
                 driver.get(base)
                 self._wait_ready(driver, timeout, debug)
                 
-                # Download Equity CSV if requested
+                # Scrape Equity table if requested
                 if not sme_only:
-                    equity_csv = self._download_tab_csv(
-                        driver, symbol, "equity", timeout, debug, download_dir
-                    )
+                    equity_data = self._scrape_tab_table(driver, symbol, "equity", timeout, debug)
                 
-                # Download SME CSV if requested
+                # Scrape SME table if requested
                 if not equity_only:
-                    sme_csv = self._download_tab_csv(
-                        driver, symbol, "sme", timeout, debug, download_dir
-                    )
+                    sme_data = self._scrape_tab_table(driver, symbol, "sme", timeout, debug)
                 
                 # Return if we got what we needed
-                if (equity_only and equity_csv) or (sme_only and sme_csv) or (equity_csv and sme_csv):
-                    return equity_csv, sme_csv
-                elif not equity_only and not sme_only and (equity_csv or sme_csv):
-                    return equity_csv, sme_csv
+                if (equity_only and equity_data) or (sme_only and sme_data) or (equity_data and sme_data):
+                    return equity_data, sme_data
+                elif not equity_only and not sme_only and (equity_data or sme_data):
+                    return equity_data, sme_data
 
             except (TimeoutException, NoSuchElementException, WebDriverException) as e:
                 self.stdout.write(self.style.ERROR(f"[Attempt {attempt}/{retries}] Error: {e}"))
-                self._save_page_source(driver, download_dir, debug)
+                self._save_page_source(driver, debug)
                 time.sleep(3 * attempt)
 
-        return equity_csv, sme_csv
+        return equity_data, sme_data
 
-    def _download_tab_csv(
+    def _scrape_tab_table(
         self, 
         driver: webdriver.Chrome, 
         symbol: str, 
         tab_type: str, 
         timeout: int, 
-        debug: bool, 
-        download_dir: str
-    ) -> str | None:
-        """Download CSV for a specific tab (equity or sme)"""
+        debug: bool
+    ) -> list[dict] | None:
+        """Scrape corporate actions table for a specific tab (equity or sme)"""
         try:
             # Construct URL for specific tab
             if tab_type.lower() == "equity":
                 url = f"https://www.nseindia.com/companies-listing/corporate-filings-actions?symbol={symbol}&tabIndex=equity"
-                download_button_id = "CFcorpactionsEquity-download"
+                table_id = "Corporate_Actions"
                 tab_name = "Equity"
             else:  # SME
                 url = f"https://www.nseindia.com/companies-listing/corporate-filings-actions?symbol={symbol}&tabIndex=sme"
-                download_button_id = "CFcorpactionsSME-download"
+                table_id = "Corporate_Actions_sme"
                 tab_name = "SME"
             
             if debug:
@@ -283,92 +344,69 @@ class Command(BaseCommand):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
 
-            # Wait for the specific tab content to be loaded
-            if tab_type.lower() == "sme":
-                try:
-                    # Wait for SME tab content
-                    WebDriverWait(driver, timeout).until(
-                        EC.presence_of_element_located((By.ID, "Corporate_Actions_sme"))
-                    )
-                except TimeoutException:
-                    self.stdout.write(self.style.WARNING(f"SME tab content not found for {symbol}. May not have SME data."))
-                    return None
-
-            # Find and click download button
-            if debug:
-                self.stdout.write(self.style.WARNING(f"Searching for {tab_name} download button: {download_button_id}"))
-            
-            # Get files before download
-            before_files = set(glob.glob(os.path.join(download_dir, "*.csv")))
-            
-            download_button = WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.ID, download_button_id))
-            )
-            
-            if debug:
-                self.stdout.write(self.style.SUCCESS(f"Found {tab_name} download button"))
-            
-            # Click download button
-            driver.execute_script("arguments[0].click();", download_button)
-            
-            # Wait for download with multiple checks
-            download_file = self._wait_for_download(download_dir, before_files, timeout, debug, tab_name)
-            
-            if download_file:
-                if debug:
-                    self.stdout.write(self.style.SUCCESS(f"{tab_name} CSV downloaded: {download_file}"))
-                return download_file
-            else:
-                self.stdout.write(self.style.WARNING(f"No {tab_name} CSV file detected after download"))
+            # Wait for the specific tab table
+            try:
+                table = WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((By.ID, table_id))
+                )
+            except TimeoutException:
+                self.stdout.write(self.style.WARNING(f"{tab_name} table not found for {symbol}. May not have {tab_name} data."))
                 return None
-                
-        except TimeoutException as e:
-            self.stdout.write(self.style.ERROR(f"{tab_name} download failed - timeout: {e}"))
-            return None
+
+            # Get table headers
+            headers = []
+            header_row = table.find_element(By.TAG_NAME, "thead").find_element(By.TAG_NAME, "tr")
+            for th in header_row.find_elements(By.TAG_NAME, "th"):
+                headers.append(th.text.strip())
+            
+            if not headers:
+                self.stdout.write(self.style.WARNING(f"No headers found in {tab_name} table for {symbol}"))
+                return None
+
+            # Get table rows
+            data = []
+            rows = table.find_elements(By.TAG_NAME, "tbody")[0].find_elements(By.TAG_NAME, "tr")
+            for row in rows:
+                try:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    row_data = {}
+                    for i, cell in enumerate(cells):
+                        if i < len(headers):
+                            row_data[headers[i]] = cell.text.strip()
+                    if row_data:
+                        data.append(row_data)
+                except Exception as e:
+                    self.stdout.write(self.style.WARNING(f"Error parsing {tab_name} table row: {e}"))
+            
+            if debug:
+                self.stdout.write(self.style.SUCCESS(f"Scraped {len(data)} rows from {tab_name} table for {symbol}"))
+            
+            return data if data else None
+
         except Exception as e:
-            self.stdout.write(self.style.ERROR(f"{tab_name} download failed: {e}"))
+            self.stdout.write(self.style.ERROR(f"{tab_name} scrape failed: {e}"))
             return None
 
-    def _wait_for_download(
-        self, 
-        download_dir: str, 
-        before_files: set, 
-        timeout: int, 
-        debug: bool, 
-        tab_name: str
-    ) -> str | None:
-        """Wait for download to complete and return the downloaded file path"""
-        end_time = time.time() + timeout
-        
-        while time.time() < end_time:
-            time.sleep(1)
-            
-            # Check for new CSV files
-            current_files = set(glob.glob(os.path.join(download_dir, "*.csv")))
-            new_files = current_files - before_files
-            
-            if new_files:
-                # Check if any new files are complete (not being downloaded)
-                for file_path in new_files:
-                    try:
-                        # Check if file is not being written to
-                        initial_size = os.path.getsize(file_path)
-                        time.sleep(0.5)
-                        final_size = os.path.getsize(file_path)
-                        
-                        if initial_size == final_size and final_size > 0:
-                            if debug:
-                                self.stdout.write(self.style.SUCCESS(f"{tab_name} download completed: {file_path}"))
-                            return file_path
-                    except OSError:
-                        continue
-            
-            # Check for .crdownload files (Chrome partial downloads)
-            partial_files = glob.glob(os.path.join(download_dir, "*.crdownload"))
-            if partial_files and debug:
-                self.stdout.write(self.style.WARNING(f"Download in progress: {len(partial_files)} partial file(s)"))
-        
-        return None
+    def _build_chrome_options(self, headless: bool) -> Options:
+        opts = Options()
+        if headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
+        opts.add_experimental_option("prefs", {
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": True,
+        })
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_argument("--lang=en-US,en;q=0.9")
+        return opts
 
     def _wait_ready(self, driver: webdriver.Chrome, timeout: int, debug: bool):
         if debug:
@@ -380,9 +418,9 @@ class Command(BaseCommand):
         if debug:
             self.stdout.write(self.style.SUCCESS("Page fully loaded"))
 
-    def _save_page_source(self, driver: webdriver.Chrome, download_dir: str, debug: bool):
+    def _save_page_source(self, driver: webdriver.Chrome, debug: bool):
         if debug:
-            source_path = os.path.join(download_dir, f"page_source_{int(time.time())}.html")
+            source_path = f"page_source_{int(time.time())}.html"
             with open(source_path, "w", encoding="utf-8") as f:
                 f.write(driver.page_source)
             self.stdout.write(self.style.WARNING(f"Saved page source to: {source_path}"))

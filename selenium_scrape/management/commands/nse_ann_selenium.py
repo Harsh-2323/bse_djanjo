@@ -4,18 +4,25 @@ Scrape NSE Corporate Filings (Announcements) and save to **Database** (no Excel)
 
 - Cleans Subject (strips "Time Taken" etc.)
 - Captures PDF + XBRL links into separate columns
+- Downloads PDFs and uploads to Cloudflare R2
 - Parses XBRL (works with /api/xbrl/{id} JSON, ZIPs, XML/XBRL)
 - Shares Selenium cookies with requests so API calls behave like the browser
+- Extracts Details content from announcement rows
+- Separates datetime into date and time columns
 """
 
 import os, re, time, io, zipfile, json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
+import hashlib
+from pathlib import Path
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.conf import settings
 import xml.etree.ElementTree as ET
 
 # Selenium
@@ -25,6 +32,10 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+# Boto3 for R2
+import boto3
+from botocore.config import Config
 
 try:
     from webdriver_manager.chrome import ChromeDriverManager
@@ -52,6 +63,136 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+
+
+# ---------- R2 Configuration ----------
+def _get_r2_client():
+    """Initialize and return Cloudflare R2 client."""
+    return boto3.client(
+        's3',
+        endpoint_url=os.getenv('R2_ENDPOINT'),
+        aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+        config=Config(signature_version='s3v4'),
+        region_name='auto'
+    )
+
+
+def _generate_pdf_key(symbol, subject, disseminated_date, original_filename=None):
+    """Generate a unique R2 key for the PDF file."""
+    # Create a hash from symbol, subject, and date for uniqueness
+    content_hash = hashlib.md5(f"{symbol}_{subject}_{disseminated_date}".encode()).hexdigest()[:8]
+    
+    # Clean up filename components
+    clean_symbol = re.sub(r'[^a-zA-Z0-9]', '_', symbol or 'unknown')
+    clean_date = re.sub(r'[^a-zA-Z0-9]', '_', disseminated_date or 'nodate')
+    
+    # Use original filename if available, otherwise create generic name
+    if original_filename:
+        filename = Path(original_filename).stem
+        extension = Path(original_filename).suffix or '.pdf'
+    else:
+        filename = f"announcement_{content_hash}"
+        extension = '.pdf'
+    
+    # Construct the key: nse/{symbol}/{year}/{filename}_{hash}.pdf
+    year = clean_date.split('_')[2] if len(clean_date.split('_')) >= 3 else 'unknown'
+    r2_key = f"nse/{clean_symbol}/{year}/{filename}_{content_hash}{extension}"
+    
+    return r2_key
+
+
+def _upload_pdf_to_r2(pdf_content, r2_key, debug=False):
+    """Upload PDF content to Cloudflare R2 and return the public URL."""
+    try:
+        r2_client = _get_r2_client()
+        bucket_name = os.getenv('R2_BUCKET', 'market-filings')
+        
+        # Upload the file
+        r2_client.put_object(
+            Bucket=bucket_name,
+            Key=r2_key,
+            Body=pdf_content,
+            ContentType='application/pdf',
+            ContentDisposition='inline'
+        )
+        
+        # Generate public URL
+        public_base_url = os.getenv('R2_PUBLIC_BASEURL', 'https://market-filings.r2.dev')
+        public_url = f"{public_base_url}/{r2_key}"
+        
+        if debug:
+            print(f"✅ Uploaded PDF to R2: {r2_key}")
+        
+        return public_url, r2_key
+        
+    except Exception as e:
+        if debug:
+            print(f"❌ R2 upload failed for {r2_key}: {e}")
+        return None, None
+
+
+def _download_and_upload_pdf(pdf_url, symbol, subject, disseminated_date, session, debug=False):
+    """Download PDF from NSE and upload to R2. Returns (public_url, r2_key, None)."""
+    try:
+        # Download PDF
+        response = session.get(pdf_url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        pdf_content = response.content
+        if not pdf_content:
+            if debug:
+                print(f"❌ Empty PDF content from {pdf_url}")
+            return None, None, None
+        
+        # Extract filename from URL
+        parsed_url = urlparse(pdf_url)
+        original_filename = Path(parsed_url.path).name or 'announcement.pdf'
+        
+        # Generate R2 key
+        r2_key = _generate_pdf_key(symbol, subject, disseminated_date, original_filename)
+        
+        # Upload to R2
+        public_url, r2_key = _upload_pdf_to_r2(pdf_content, r2_key, debug)
+        
+        return public_url, r2_key, None
+            
+    except Exception as e:
+        if debug:
+            print(f"❌ PDF download/upload failed for {pdf_url}: {e}")
+        return None, None, None
+
+
+# ---------- datetime parsing helpers ----------
+def _parse_nse_datetime(datetime_str):
+    """
+    Parse NSE datetime format (e.g., '2-Jan-2024 14:30:45') and return (date, time) tuple.
+    Returns (None, None) if parsing fails.
+    """
+    if not datetime_str or not isinstance(datetime_str, str):
+        return None, None
+    
+    datetime_str = datetime_str.strip()
+    if not datetime_str:
+        return None, None
+    
+    # Match the NSE datetime pattern
+    match = re.match(r'(\d{1,2}-[A-Za-z]{3}-\d{4})\s+(\d{2}:\d{2}:\d{2})', datetime_str)
+    if not match:
+        return None, None
+    
+    date_part = match.group(1)  # e.g., '2-Jan-2024'
+    time_part = match.group(2)  # e.g., '14:30:45'
+    
+    try:
+        # Parse the date part to ensure it's valid and reformat consistently
+        parsed_date = datetime.strptime(date_part, '%d-%b-%Y')
+        formatted_date = parsed_date.strftime('%d-%b-%Y')  # Consistent format
+        return formatted_date, time_part
+    except ValueError:
+        # If date parsing fails, return the original parts
+        return date_part, time_part
+
 
 # ---------- selenium & session helpers ----------
 def _setup_driver(headless: bool):
@@ -143,6 +284,25 @@ def _cell_text(td):
     return re.sub(r"\s{2,}", " ", txt)
 
 
+def _extract_details_content(td):
+    """Extract details content from a table cell, handling eclipse/readMore spans."""
+    if not td:
+        return ""
+    
+    # Look for content eclipse spans with readMore IDs
+    eclipse_span = td.select_one('span.content.eclipse[id^="readMore"]')
+    if eclipse_span:
+        details_text = eclipse_span.get_text(strip=True)
+        # Clean up any trailing ellipsis
+        if details_text.endswith('...'):
+            details_text = details_text[:-3].strip()
+        return details_text
+    
+    # Fallback to regular text extraction
+    details_text = _cell_text(td)
+    return details_text
+
+
 def _has_pdf_link(td) -> bool:
     return bool(td and td.select_one('a[href*=".pdf" i]'))
 
@@ -178,6 +338,40 @@ def _looks_like_company(s: str) -> bool:
         return True
     alpha_ratio = sum(ch.isalpha() for ch in s) / max(1, len(s))
     return alpha_ratio > 0.5 and not s.isupper()
+
+
+def _looks_like_details(s: str) -> bool:
+    """Check if text looks like announcement details content."""
+    if not s or len(s.strip()) < 10:
+        return False
+    
+    # Skip if it's clearly other types of content
+    if _is_broadcast_text(s):
+        return False
+    if _looks_like_symbol(s) or re.search(DT_RE, s):
+        return False
+    
+    # Look for common patterns in announcement details
+    detail_patterns = [
+        r"has informed",
+        r"intimation",
+        r"pursuant to",
+        r"regulation",
+        r"announcement",
+        r"disclosure",
+        r"meeting",
+        r"dividend",
+        r"result",
+        r"acquisition",
+        r"merger"
+    ]
+    
+    text_lower = s.lower()
+    if any(pattern in text_lower for pattern in detail_patterns):
+        return True
+    
+    # If it's a reasonably long text that's not clearly something else, consider it details
+    return len(s.strip()) > 50
 
 
 def _is_broadcast_text(s: str) -> bool:
@@ -422,7 +616,8 @@ def _fetch_and_parse_xbrl(url, session: requests.Session, debug=False):
 
 
 # ---------- extraction ----------
-def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bool=True, http_sess: requests.Session | None=None) -> pd.DataFrame:
+def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bool=True, 
+                       upload_pdfs: bool=True, http_sess: requests.Session | None=None) -> pd.DataFrame:
     soup = BeautifulSoup(driver.page_source, "lxml")
     colmap = _build_header_map(soup)
     if debug:
@@ -450,32 +645,45 @@ def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bo
         if not _in_range(idx_attach, tds):
             idx_attach = next((i for i, td in enumerate(tds) if _has_pdf_link(td) or _has_xbrl_link(td)), None)
 
-        # 3) symbol/company via headers or heuristics
+        # 3) detect details column
+        idx_details = colmap.get("details")
+        if not _in_range(idx_details, tds):
+            # Look for details by content pattern
+            idx_details = next((i for i, t in enumerate(texts) 
+                              if _looks_like_details(t) and i not in {b_idx, idx_attach}), None)
+
+        # 4) symbol/company via headers or heuristics
         idx_symbol = colmap.get("symbol")
         if not _in_range(idx_symbol, tds) or not _looks_like_symbol(texts[idx_symbol]):
             idx_symbol = next((i for i, t in enumerate(texts)
-                               if _looks_like_symbol(t) and i not in {b_idx, idx_attach}), None)
+                               if _looks_like_symbol(t) and i not in {b_idx, idx_attach, idx_details}), None)
 
         idx_company = colmap.get("companyname") or colmap.get("company")
         if not _in_range(idx_company, tds) or not _looks_like_company(texts[idx_company]):
             cand = None
             if _in_range(idx_symbol, tds):
                 for nb in (idx_symbol + 1, idx_symbol - 1):
-                    if _in_range(nb, tds) and _looks_like_company(texts[nb]) and nb not in {b_idx, idx_attach}:
+                    if (_in_range(nb, tds) and _looks_like_company(texts[nb]) 
+                        and nb not in {b_idx, idx_attach, idx_details}):
                         cand = nb
                         break
             if cand is None:
                 cand = next((i for i, t in enumerate(texts)
-                             if _looks_like_company(t) and i not in {b_idx, idx_attach, idx_symbol}), None)
+                             if _looks_like_company(t) and i not in {b_idx, idx_attach, idx_symbol, idx_details}), None)
             idx_company = cand
 
-        # 4) subject: header if valid; else longest clean text
+        # 5) subject: header if valid; else longest clean text
         idx_subject = colmap.get("subject")
         if not _in_range(idx_subject, tds) or _is_broadcast_text(texts[idx_subject]):
-            banned = {x for x in [b_idx, idx_attach, idx_symbol, idx_company] if _in_range(x, tds)}
+            banned = {x for x in [b_idx, idx_attach, idx_symbol, idx_company, idx_details] if _in_range(x, tds)}
             idx_subject, subj_text = _pick_subject_candidate(texts, banned)
         else:
             subj_text = _clean_subject(texts[idx_subject])
+
+        # Extract details content
+        details = ""
+        if _in_range(idx_details, tds):
+            details = _extract_details_content(tds[idx_details])
 
         symbol = texts[idx_symbol] if _in_range(idx_symbol, tds) and _looks_like_symbol(texts[idx_symbol]) else ""
         company_name = texts[idx_company] if _in_range(idx_company, tds) and _looks_like_company(texts[idx_company]) else ""
@@ -485,9 +693,16 @@ def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bo
 
         # broadcast split
         rec = dis = taken = ""
+        rec_date = rec_time = dis_date = dis_time = ""
         if _in_range(b_idx, tds):
             bd = _parse_broadcast_text(texts[b_idx])
             rec, dis, taken = bd["Exchange Received Time"], bd["Exchange Dissemination Time"], bd["Time Taken"]
+            
+            # Parse datetime strings into separate date and time components
+            if rec:
+                rec_date, rec_time = _parse_nse_datetime(rec)
+            if dis:
+                dis_date, dis_time = _parse_nse_datetime(dis)
 
         # --- attachments (PDF + XBRL) ---
         pdf_links, xbrl_links = [], []
@@ -529,15 +744,46 @@ def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bo
         pdf_links = _dedup(pdf_links)
         xbrl_links = _dedup(xbrl_links)
 
+        # --- PDF Upload to R2 ---
+        pdf_cloud_url = pdf_r2_key = pdf_local_path = ""
+        if upload_pdfs and pdf_links:
+            primary_pdf = pdf_links[0]  # Use first PDF if multiple
+            try:
+                pdf_cloud_url, pdf_r2_key, pdf_local_path = _download_and_upload_pdf(
+                    primary_pdf, symbol, subject, dis_date, sess, debug
+                )
+                if debug and pdf_cloud_url:
+                    print(f"✅ PDF uploaded: {symbol} -> {pdf_cloud_url}")
+            except Exception as e:
+                if debug:
+                    print(f"❌ PDF upload failed for {symbol}: {e}")
+
         row = {
             "Symbol": symbol,
             "Company Name": company_name,
             "Subject": subject,
+            "Details": details,
+            
+            # Original combined datetime fields (for backward compatibility)
             "Exchange Received Time": rec,
             "Exchange Dissemination Time": dis,
             "Time Taken": taken,
+            
+            # New separate date and time fields
+            "Exchange Received Date": rec_date or "",
+            "Exchange Received Time Only": rec_time or "",
+            "Exchange Disseminated Date": dis_date or "",
+            "Exchange Disseminated Time Only": dis_time or "",
+            
             "Attachment Size": re.sub(r"\s*PDF\s*", "", texts[idx_attach], flags=re.I).strip() if _in_range(idx_attach, tds) else None,
             "Attachment Link": " | ".join(pdf_links) if pdf_links else "",
+            
+            # PDF storage fields
+            "PDF Link Web": " | ".join(pdf_links) if pdf_links else "",
+            "PDF Path Local": pdf_local_path or "",
+            "PDF Path Cloud": pdf_cloud_url or "",
+            "PDF R2 Path": pdf_r2_key or "",
+            
             "XBRL Link": " | ".join(xbrl_links) if xbrl_links else "",
             "Has XBRL": bool(xbrl_links),
 
@@ -568,7 +814,7 @@ def _extract_table_html(driver, max_rows: int, debug: bool=False, xbrl_parse: bo
 
 # ---------- command ----------
 class Command(BaseCommand):
-    help = "Scrape NSE announcements → Database (cleans Subject; splits times; includes & parses XBRL)."
+    help = "Scrape NSE announcements → Database (cleans Subject; splits times; includes & parses XBRL; extracts Details; separates date/time; uploads PDFs to R2)."
 
     def add_arguments(self, parser):
         parser.add_argument("--max-rows", type=int, default=100)
@@ -578,6 +824,8 @@ class Command(BaseCommand):
         parser.add_argument("--debug", action="store_true")
         parser.add_argument("--xbrl-parse", dest="xbrl_parse", action="store_true", default=True)
         parser.add_argument("--no-xbrl-parse", dest="xbrl_parse", action="store_false")
+        parser.add_argument("--upload-pdfs", dest="upload_pdfs", action="store_true", default=True)
+        parser.add_argument("--no-upload-pdfs", dest="upload_pdfs", action="store_false")
 
     def handle(self, *args, **opts):
         max_rows  = int(opts["max_rows"])
@@ -586,8 +834,18 @@ class Command(BaseCommand):
         stall     = int(opts["stall"])
         debug     = bool(opts.get("debug"))
         xbrl_parse = bool(opts.get("xbrl_parse"))
+        upload_pdfs = bool(opts.get("upload_pdfs"))
+
+        # Check R2 configuration if PDF upload is enabled
+        if upload_pdfs:
+            required_env = ['R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET']
+            missing_env = [var for var in required_env if not os.getenv(var)]
+            if missing_env:
+                raise CommandError(f"Missing required R2 environment variables: {', '.join(missing_env)}")
 
         self.stdout.write(f"→ Launching Chrome (headless={headless})")
+        self.stdout.write(f"→ PDF Upload: {'Enabled' if upload_pdfs else 'Disabled'}")
+        
         driver = None
         try:
             driver = _setup_driver(headless=headless)
@@ -608,7 +866,14 @@ class Command(BaseCommand):
             sess = _session_from_driver(driver)
 
             _load_enough_rows(driver, max_rows=max_rows, pause=pause, stall_tolerance=stall)
-            df = _extract_table_html(driver, max_rows=max_rows, debug=debug, xbrl_parse=xbrl_parse, http_sess=sess)
+            df = _extract_table_html(
+                driver, 
+                max_rows=max_rows, 
+                debug=debug, 
+                xbrl_parse=xbrl_parse, 
+                upload_pdfs=upload_pdfs,
+                http_sess=sess
+            )
 
         finally:
             if driver:
@@ -633,19 +898,34 @@ class Command(BaseCommand):
                 return None
             return v
 
-        count_new, count_existing = 0, 0
+        count_new, count_existing, count_pdfs_uploaded = 0, 0, 0
+        
         for _, row in df.iterrows():
+            # Create unique key using separate date and time fields
             unique_key = {
                 "symbol": _none_if_blank(row.get("Symbol")),
                 "subject": _none_if_blank(row.get("Subject")),
-                "exchange_dissemination_time": _none_if_blank(row.get("Exchange Dissemination Time")),
+                "exchange_disseminated_date": _none_if_blank(row.get("Exchange Disseminated Date")),
+                "exchange_disseminated_time_only": _none_if_blank(row.get("Exchange Disseminated Time Only")),
             }
+            
             defaults = {
                 "company_name": _none_if_blank(row.get("Company Name")),
-                "exchange_received_time": _none_if_blank(row.get("Exchange Received Time")),
-                "time_taken": _none_if_blank(row.get("Time Taken")),
+                "details": _none_if_blank(row.get("Details")),
+                
+                # New separate date/time fields
+                "exchange_received_date": _none_if_blank(row.get("Exchange Received Date")),
+                "exchange_received_time_only": _none_if_blank(row.get("Exchange Received Time Only")),
+                
                 "attachment_size": _none_if_blank(row.get("Attachment Size")),
                 "attachment_link": _none_if_blank(row.get("Attachment Link")),
+                
+                # PDF storage fields
+                "pdf_link_web": _none_if_blank(row.get("PDF Link Web")),
+                "pdf_path_local": _none_if_blank(row.get("PDF Path Local")),
+                "pdf_path_cloud": _none_if_blank(row.get("PDF Path Cloud")),
+                "pdf_r2_path": _none_if_blank(row.get("PDF R2 Path")),
+                
                 "xbrl_link": _none_if_blank(row.get("XBRL Link")),
                 "has_xbrl": bool(row.get("Has XBRL")),
                 "xbrl_nse_symbol": _none_if_blank(row.get("XBRL NSE Symbol")),
@@ -663,11 +943,23 @@ class Command(BaseCommand):
                     **unique_key,
                     defaults=defaults
                 )
+            
             if created:
                 count_new += 1
             else:
                 count_existing += 1
+            
+            # Count successful PDF uploads
+            if _none_if_blank(row.get("PDF Path Cloud")):
+                count_pdfs_uploaded += 1
 
-        self.stdout.write(self.style.SUCCESS(
-            f"✅ {count_new} new NSE records inserted, {count_existing} already existed"
-        ))
+        # Summary message
+        summary_parts = [
+            f"✅ {count_new} new NSE records inserted",
+            f"{count_existing} already existed"
+        ]
+        
+        if upload_pdfs:
+            summary_parts.append(f"{count_pdfs_uploaded} PDFs uploaded to R2")
+        
+        self.stdout.write(self.style.SUCCESS(", ".join(summary_parts)))
