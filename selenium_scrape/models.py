@@ -8,8 +8,8 @@ class SeleniumAnnouncement(models.Model):
     company_code = models.CharField(max_length=20, null=True, blank=True)
 
     # NEW
-    headline = models.TextField(null=True, blank=True)
-    category = models.CharField(max_length=120, null=True, blank=True, db_index=True)
+    category = models.TextField(null=True, blank=True)
+    headline = models.TextField(null=True, blank=True)  # Reverted to TextField
 
     # Legacy (kept for compatibility with existing code)
     announcement_text = models.TextField(null=True, blank=True)
@@ -42,11 +42,10 @@ class SeleniumAnnouncement(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["company_code", "exchange_disseminated_date", "exchange_disseminated_time"]),
-            models.Index(fields=["category"]),
         ]
 
     def __str__(self):
-        txt = self.headline or self.announcement_text or ""
+        txt = self.category or self.announcement_text or ""
         return f"{self.company_name or ''} - {txt[:50]}"
 
 from django.db import models

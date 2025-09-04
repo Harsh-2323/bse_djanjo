@@ -1,7 +1,7 @@
 from datetime import datetime
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -23,7 +23,7 @@ from selenium_scrape.models import SeleniumAnnouncement
 # Constants
 BSE_URL = "https://www.bseindia.com/corporates/ann.html"
 
-# Cloudflare R2 Configuration (from environment variables)
+# Cloudflare R2 Configuration
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT")
@@ -31,10 +31,49 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET")
 R2_PUBLIC_BASEURL = os.getenv("R2_PUBLIC_BASEURL")
 R2_BASE_PATH = "bse_announcements"
 
-# -----------------------------
-# Selenium setup
-# -----------------------------
+# Enhanced Category Mapping
+CATEGORY_MAPPING = {
+    'agm': 'Annual General Meeting',
+    'annual general meeting': 'Annual General Meeting',
+    'egm': 'Extraordinary General Meeting',
+    'extraordinary general meeting': 'Extraordinary General Meeting',
+    'board meeting': 'Board Meeting',
+    'board': 'Board Meeting',
+    'dividend': 'Dividend',
+    'bonus': 'Bonus Issue',
+    'split': 'Stock Split',
+    'rights': 'Rights Issue',
+    'result': 'Financial Results',
+    'financial result': 'Financial Results',
+    'quarterly result': 'Financial Results',
+    'annual result': 'Financial Results',
+    'disclosure': 'Corporate Disclosure',
+    'intimation': 'Corporate Intimation',
+    'allotment': 'Share Allotment',
+    'newspaper': 'Newspaper Publication',
+    'advertisement': 'Advertisement',
+    'cessation': 'Management Changes',
+    'appointment': 'Management Changes',
+    'resignation': 'Management Changes',
+    'compliance': 'Regulatory Compliance',
+    'regulation 30': 'Regulatory Compliance',
+    'regulation 29': 'Regulatory Compliance',
+    'takeover': 'Takeover/Acquisition',
+    'acquisition': 'Takeover/Acquisition',
+    'merger': 'Merger',
+    'voting': 'Voting Results',
+    'scrutinizer': 'Voting Results',
+    'e-voting': 'E-Voting',
+    'share transfer': 'Share Transfer',
+    'register': 'Share Transfer',
+    'annual report': 'Annual Report',
+    'outcome': 'Meeting Outcome',
+    'closure': 'Book Closure',
+    'record date': 'Record Date'
+}
+
 def setup_driver(headless: bool = True):
+    """Setup Chrome driver with optimized options"""
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
@@ -56,13 +95,172 @@ def setup_driver(headless: bool = True):
 
     return webdriver.Chrome(options=opts)
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def safe_filename(name: str, max_len: int = 150) -> str:
-    name = re.sub(r'[\\/*?:"<>|]', "_", name or "")
+    """Create safe filename from text"""
+    if not name:
+        return "announcement"
+    
+    # Clean the name
+    name = re.sub(r'[\\/*?:"<>|]', "_", name)
     name = re.sub(r"\s+", " ", name).strip()
-    return name[:max_len] or "announcement"
+    
+    # Truncate if too long
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    
+    return name or "announcement"
+
+def clean_text(text: str) -> str:
+    """Clean and normalize text"""
+    if not text:
+        return ""
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Remove common artifacts
+    text = re.sub(r'Read less\.\.', '', text)
+    text = re.sub(r'\.{3,}', '...', text)  # Normalize ellipsis
+    
+    return text
+
+def extract_company_details(newssub: str) -> Tuple[str, str]:
+    """Extract company name and code from NEWSSUB field"""
+    if not newssub:
+        return "", ""
+    
+    # Pattern: "Company Name - Code - Description"
+    # Try to find company code (6 digits)
+    code_match = re.search(r'\b(\d{6})\b', newssub)
+    company_code = code_match.group(1) if code_match else ""
+    
+    # Extract company name (everything before first " - ")
+    if " - " in newssub:
+        company_name = newssub.split(" - ")[0].strip()
+    else:
+        # Fallback: remove code from end if present
+        company_name = re.sub(r'\s*-?\s*\d{6}\s*-?.*$', '', newssub).strip()
+    
+    return company_name, company_code
+
+def categorize_announcement(text: str) -> str:
+    """Intelligently categorize announcement based on content"""
+    if not text:
+        return "General"
+    
+    text_lower = text.lower()
+    
+    # Check against category mapping
+    for keyword, category in CATEGORY_MAPPING.items():
+        if keyword in text_lower:
+            return category
+    
+    # Additional pattern matching
+    if re.search(r'\b(esop|employee stock option)\b', text_lower):
+        return "Employee Stock Options"
+    
+    if re.search(r'\b(debenture|bond|debt)\b', text_lower):
+        return "Debt Securities"
+    
+    if re.search(r'\b(credit rating|rating)\b', text_lower):
+        return "Credit Rating"
+    
+    return "General"
+
+def extract_announcement_data(table) -> Dict[str, str]:
+    """
+    Enhanced extraction function with better field separation
+    """
+    data = {
+        'headline': '',
+        'announcement_text': '',
+        'category': '',
+        'company_name': '',
+        'company_code': ''
+    }
+    
+    try:
+        # 1. Extract NEWSSUB (Company info)
+        newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
+        newssub = clean_text(newssub_tag.get_text(strip=True)) if newssub_tag else ""
+        
+        if newssub:
+            data['company_name'], data['company_code'] = extract_company_details(newssub)
+        
+        # 2. Extract HEADLINE (Primary content)
+        headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
+        if headline_tag:
+            headline_text = clean_text(headline_tag.get_text(strip=True))
+            
+            # Remove company info from headline if it exists
+            if data['company_name'] and headline_text.startswith(data['company_name']):
+                headline_text = headline_text[len(data['company_name']):].lstrip(' -')
+            
+            # Remove company code from headline
+            if data['company_code']:
+                headline_text = re.sub(fr'\b{data["company_code"]}\b\s*-?\s*', '', headline_text)
+            
+            data['headline'] = clean_text(headline_text)
+        
+        # 3. Extract announcement content from UUID div
+        uuid_regex = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+        announcement_div = table.find("div", id=uuid_regex)
+        
+        if announcement_div:
+            announcement_content = clean_text(announcement_div.get_text(strip=True))
+            
+            # If announcement content is different from headline, use it
+            if announcement_content and announcement_content != data['headline']:
+                data['announcement_text'] = announcement_content
+            else:
+                data['announcement_text'] = data['headline']
+        else:
+            # Fallback: use headline as announcement text
+            data['announcement_text'] = data['headline']
+        
+        # 4. Generate category based on content
+        content_for_categorization = f"{data['headline']} {data['announcement_text']}"
+        data['category'] = categorize_announcement(content_for_categorization)
+        
+        # 5. Ensure we have minimum required content
+        if not data['announcement_text'] and not data['headline']:
+            # Last resort: try to extract from any meaningful text in the table
+            all_text_elements = table.find_all(text=True)
+            meaningful_texts = []
+            
+            for text in all_text_elements:
+                cleaned = clean_text(text)
+                if (len(cleaned) > 20 and 
+                    not re.match(r'^\d{2}-\d{2}-\d{4}', cleaned) and  # Not date
+                    not re.match(r'^\d{2}:\d{2}:\d{2}', cleaned) and  # Not time
+                    'exchange' not in cleaned.lower() and
+                    'pdf' not in cleaned.lower() and
+                    'view' not in cleaned.lower()):
+                    meaningful_texts.append(cleaned)
+            
+            if meaningful_texts:
+                # Use the longest meaningful text
+                data['announcement_text'] = max(meaningful_texts, key=len)
+                if not data['headline']:
+                    # Create headline from first 100 chars
+                    data['headline'] = data['announcement_text'][:100] + "..." if len(data['announcement_text']) > 100 else data['announcement_text']
+        
+        # 6. Final cleanup and validation
+        if data['headline'] and len(data['headline']) > 300:
+            data['headline'] = data['headline'][:297] + "..."
+        
+        if data['category'] and len(data['category']) > 100:
+            data['category'] = data['category'][:100]
+        
+    except Exception as e:
+        print(f"Error in extract_announcement_data: {e}")
+        # Ensure we have some basic data even on error
+        if not data['announcement_text'] and not data['headline']:
+            data['announcement_text'] = "Error extracting announcement content"
+            data['headline'] = "Error extracting headline"
+            data['category'] = "General"
+    
+    return data
 
 def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[str]:
     """Fetch PDF from pdf_url and upload to Cloudflare R2, return the R2 public URL."""
@@ -80,7 +278,7 @@ def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": BSE_URL,
-            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Accept": "application/pdf,application/octet-stream;q=0.9,/;q=0.8",
         }
         with requests.get(pdf_url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as r:
             if not r.ok:
@@ -107,86 +305,16 @@ def upload_pdf_to_r2(pdf_url: str, r2_path: str, timeout: int = 30) -> Optional[
         print(f"Error uploading PDF to R2 for {pdf_url}: {e}")
         return None
 
-def _extract_category_from_table(table) -> str:
-    try:
-        rows = table.find_all("tr")
-        if not rows:
-            return ""
-        tds = rows[0].find_all("td")
-        for td in reversed(tds):
-            txt = (td.get_text(" ", strip=True) or "").strip()
-            if not txt:
-                continue
-            if re.search(r"\b\d+(\.\d+)?\s*(KB|MB)\b", txt, flags=re.I):
-                continue
-            if txt.upper() == "XBRL":
-                continue
-            return txt
-    except Exception:
-        pass
-    return ""
-
-def extract_announcement_fields_from_table(driver, table):
-    """Extract headline and announcement text from the correct locations."""
-    headline = ""
-    announcement_text = ""
-    
-    try:
-        # Extract headline using the CSS selector pattern
-        headline_element = table.select_one("tr:nth-child(4) td table:nth-child(1) tr:nth-child(1) td:nth-child(1)")
-        if headline_element:
-            headline = headline_element.get_text(strip=True)
-        
-        # For announcement text, look for divs with UUID-like IDs
-        announcement_divs = table.find_all("div", id=True)
-        for div in announcement_divs:
-            div_id = div.get("id", "")
-            if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', div_id):
-                announcement_text = div.get_text(strip=True)
-                break
-        
-        # Fallback: try other potential containers
-        if not announcement_text:
-            for selector in [
-                "div[id*='-']",
-                ".announcement-text",
-                "td[colspan]",
-            ]:
-                element = table.select_one(selector)
-                if element:
-                    text = element.get_text(strip=True)
-                    if text and text != headline and len(text) > 10:
-                        announcement_text = text
-                        break
-        
-        # Fallback to original method
-        if not announcement_text:
-            headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
-            if headline_tag:
-                announcement_text = headline_tag.get_text(strip=True)
-    
-    except Exception as e:
-        print(f"Error extracting announcement fields: {e}")
-        try:
-            headline_tag = table.find("span", {"ng-bind-html": "cann.HEADLINE"})
-            if headline_tag:
-                headline = headline_tag.get_text(strip=True)
-                announcement_text = headline
-        except Exception:
-            pass
-    
-    return headline, announcement_text
-
-# -----------------------------
-# Core scrape
-# -----------------------------
-def scrape_bse_announcements_like_reference(
-    target_date: str = "28-08-2025",
+def scrape_bse_announcements_enhanced(
+    target_date: str = "04-09-2025",
     headless: bool = True,
     limit: Optional[int] = None
 ) -> pd.DataFrame:
+    """Enhanced scraping function with improved data quality"""
+    
     driver = setup_driver(headless=headless)
     records: List[Dict] = []
+    
     try:
         driver.get(BSE_URL)
 
@@ -195,27 +323,28 @@ def scrape_bse_announcements_like_reference(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
         )
 
+        page_count = 0
         while True:
+            page_count += 1
+            print(f"\n--- Processing Page {page_count} ---")
+            
             # Parse current page
             soup = BeautifulSoup(driver.page_source, "lxml")
             tables = soup.find_all("table", {"ng-repeat": "cann in CorpannData.Table"})
 
-            for table in tables:
+            for i, table in enumerate(tables):
                 try:
-                    newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
+                    # Extract all data using enhanced function
+                    announcement_data = extract_announcement_data(table)
+                    
+                    # Extract PDF link
                     pdf_tag = table.find("a", class_="tablebluelink", href=True)
-
-                    newssub = (newssub_tag.get_text(strip=True) if newssub_tag else "") or ""
-                    
-                    # Extract headline and announcement text
-                    headline, announcement_text = extract_announcement_fields_from_table(driver, table)
-                    
-                    category = _extract_category_from_table(table)
                     pdf_link = urljoin(BSE_URL, pdf_tag["href"]) if pdf_tag else ""
 
                     # Extract timestamps
                     all_rows = table.find_all("tr")
                     time_row_text = all_rows[-2].get_text(strip=True) if len(all_rows) >= 2 else ""
+                    
                     match_received = re.search(
                         r"Exchange Received Time\s*(\d{2}-\d{2}-\d{4})\s*(\d{2}:\d{2}:\d{2})",
                         time_row_text
@@ -234,37 +363,48 @@ def scrape_bse_announcements_like_reference(
                     if disseminated_date != target_date:
                         continue
 
-                    company_name = newssub.split("-")[0].strip() if newssub else ""
-                    code_match = re.search(r"\b(\d{6})\b", newssub)
-                    company_code = code_match.group(1) if code_match else ""
+                    # Skip if we don't have essential data
+                    if not announcement_data['announcement_text'] and not announcement_data['headline']:
+                        print(f"Skipping record {len(records)+1}: No content")
+                        continue
 
-                    # Check for duplicate before fetching/uploading PDF
+                    # Check for duplicate before processing PDF
                     unique_key = {
-                        "company_code": company_code,
-                        "announcement_text": announcement_text,
+                        "company_code": announcement_data['company_code'],
+                        "announcement_text": announcement_data['announcement_text'],
                         "exchange_disseminated_date": disseminated_date,
                         "exchange_disseminated_time": disseminated_time,
                     }
                     if SeleniumAnnouncement.objects.filter(**unique_key).exists():
-                        continue  # Skip duplicates to avoid fetching/uploading PDF
+                        print(f"Skipping duplicate record for {announcement_data['company_name']}")
+                        continue
 
+                    # Handle PDF upload
                     pdf_path_cloud = ""
                     pdf_r2_path = ""
                     if pdf_link:
-                        code_for_name = company_code or (re.search(r"\d{6}", newssub).group() if re.search(r"\d{6}", newssub) else "NA")
+                        code_for_name = announcement_data['company_code'] or "UNKNOWN"
                         date_compact = received_date.replace("-", "") if received_date else "NA"
-                        r2_filename = f"{len(records)+1:03d}{code_for_name}{date_compact}_{safe_filename(headline)[:50]}.pdf"
+                        safe_headline = safe_filename(announcement_data['headline'])[:50]
+                        r2_filename = f"{len(records)+1:03d}{code_for_name}{date_compact}_{safe_headline}.pdf"
                         pdf_r2_path = f"{R2_BASE_PATH}/{r2_filename}"
                         pdf_path_cloud = upload_pdf_to_r2(pdf_link, pdf_r2_path)
-                        if not pdf_path_cloud:
-                            print(f"Failed to upload PDF for {headline}")
+
+                    # Enhanced debug output
+                    print(f"\n📄 Record {len(records)+1} (Page {page_count}, Item {i+1}):")
+                    print(f"   🏢 Company: {announcement_data['company_name']} ({announcement_data['company_code']})")
+                    print(f"   📰 Headline: {announcement_data['headline'][:100]}{'...' if len(announcement_data['headline']) > 100 else ''}")
+                    print(f"   📂 Category: {announcement_data['category']}")
+                    print(f"   📝 Content: {announcement_data['announcement_text'][:80]}{'...' if len(announcement_data['announcement_text']) > 80 else ''}")
+                    print(f"   🕐 Time: {disseminated_date} {disseminated_time}")
+                    print("   " + "="*80)
 
                     records.append({
-                        "Headline": headline,
-                        "Category": category,
-                        "Company Name": company_name,
-                        "Company Code": company_code,
-                        "Announcement Text": announcement_text,
+                        "Headline": announcement_data['headline'],
+                        "Category": announcement_data['category'],
+                        "Company Name": announcement_data['company_name'],
+                        "Company Code": announcement_data['company_code'],
+                        "Announcement Text": announcement_data['announcement_text'],
                         "Exchange Received Date": received_date,
                         "Exchange Received Time": received_time,
                         "Exchange Disseminated Date": disseminated_date,
@@ -276,10 +416,12 @@ def scrape_bse_announcements_like_reference(
 
                     # Stop if limit is reached
                     if limit and len(records) >= limit:
+                        print(f"\n✅ Reached limit of {limit} records")
                         return pd.DataFrame(records)
 
                 except Exception as e:
-                    print(f"Error parsing entry {len(records)+1}: {e}")
+                    print(f"❌ Error parsing entry {len(records)+1}: {e}")
+                    continue
 
             # Check for and click the "Next" button
             try:
@@ -291,27 +433,28 @@ def scrape_bse_announcements_like_reference(
                 WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
                 )
+                print(f"➡ Moving to page {page_count + 1}")
             except (TimeoutException, NoSuchElementException):
-                print("No more pages to scrape (Next button not found).")
+                print("🏁 No more pages to scrape (Next button not found).")
                 break
 
+    except Exception as e:
+        print(f"❌ Fatal error in scraper: {e}")
     finally:
         driver.quit()
 
     return pd.DataFrame(records)
 
-# -----------------------------
-# Django management command
-# -----------------------------
 class Command(BaseCommand):
-    help = "Scrape BSE Corporate Announcements for a specific date and save into Postgres (deduplicated)"
+    help = "Enhanced BSE Corporate Announcements Scraper with improved data quality"
 
     def add_arguments(self, parser):
+        today_date = datetime.now().strftime("%d-%m-%Y")
         parser.add_argument(
             "--date",
             type=str,
-            default="28-08-2025",
-            help="Target date for announcements (format: DD-MM-YYYY, e.g., 28-08-2025)",
+            default=today_date,
+            help=f"Target date for announcements (format: DD-MM-YYYY, e.g., {today_date})",
         )
         parser.add_argument(
             "--debug",
@@ -329,19 +472,22 @@ class Command(BaseCommand):
         target_date = options["date"]
         limit = options.get("limit")
         
-        if limit:
-            self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date} (LIMITED to {limit} records)...")
-        else:
-            self.stdout.write(f"🚀 Starting Enhanced BSE Announcements Scraper for {target_date}...")
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"🚀 Starting ENHANCED BSE Announcements Scraper v2.0 for {target_date}"
+                f"{f' (LIMITED to {limit} records)' if limit else ''}"
+            )
+        )
 
         # Validate date format
         try:
             datetime.strptime(target_date, "%d-%m-%Y")
         except ValueError:
-            self.stdout.write(self.style.ERROR("❌ Invalid date format. Use DD-MM-YYYY (e.g., 28-08-2025)"))
+            self.stdout.write(self.style.ERROR("❌ Invalid date format. Use DD-MM-YYYY"))
             return
 
-        items = scrape_bse_announcements_like_reference(
+        # Run enhanced scraper
+        items = scrape_bse_announcements_enhanced(
             target_date=target_date,
             headless=not options["debug"],
             limit=limit
@@ -351,12 +497,21 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING("❌ No data scraped for the specified date"))
             return
 
-        # Optional: quick sanity print
-        try:
-            self.stdout.write("\nSample:\n" + items[["Headline", "Category", "Company Name"]].head(3).to_string(index=False))
-        except Exception:
-            pass
+        # Display improved sample
+        self.stdout.write("\n" + "="*100)
+        self.stdout.write(self.style.SUCCESS("📊 ENHANCED DATA SAMPLE (First 3 records):"))
+        self.stdout.write("="*100)
+        
+        for i, row in items.head(3).iterrows():
+            self.stdout.write(f"\n🔸 Record {i+1}:")
+            self.stdout.write(f"   🏢 Company: {row['Company Name']} ({row['Company Code']})")
+            self.stdout.write(f"   📰 Headline: {row['Headline']}")
+            self.stdout.write(f"   📂 Category: {row['Category']}")
+            self.stdout.write(f"   📝 Content: {row['Announcement Text'][:100]}{'...' if len(str(row['Announcement Text'])) > 100 else ''}")
+            self.stdout.write(f"   📅 Date: {row['Exchange Disseminated Date']} {row['Exchange Disseminated Time']}")
+            self.stdout.write("   " + "-"*80)
 
+        # Save to database with transaction safety
         count_new, count_existing = 0, 0
 
         for _, row in items.iterrows():
@@ -373,29 +528,41 @@ class Command(BaseCommand):
                 continue
 
             # Create new record
-            with transaction.atomic():
-                SeleniumAnnouncement.objects.create(
-                    company_name=row.get("Company Name"),
-                    company_code=row.get("Company Code"),
-                    headline=row.get("Headline") or None,
-                    category=row.get("Category") or None,
-                    announcement_text=row.get("Announcement Text"),
-                    exchange_received_date=row.get("Exchange Received Date"),
-                    exchange_received_time=row.get("Exchange Received Time"),
-                    exchange_disseminated_date=row.get("Exchange Disseminated Date"),
-                    exchange_disseminated_time=row.get("Exchange Disseminated Time"),
-                    pdf_link_web=row.get("PDF Link (web)"),
-                    pdf_path_cloud=row.get("PDF Path (cloud)"),
-                    pdf_r2_path=row.get("PDF R2 Path"),
+            try:
+                with transaction.atomic():
+                    SeleniumAnnouncement.objects.create(
+                        company_name=row.get("Company Name") or None,
+                        company_code=row.get("Company Code") or None,
+                        headline=row.get("Headline") or None,
+                        category=row.get("Category") or None,
+                        announcement_text=row.get("Announcement Text") or None,
+                        exchange_received_date=row.get("Exchange Received Date") or None,
+                        exchange_received_time=row.get("Exchange Received Time") or None,
+                        exchange_disseminated_date=row.get("Exchange Disseminated Date") or None,
+                        exchange_disseminated_time=row.get("Exchange Disseminated Time") or None,
+                        pdf_link_web=row.get("PDF Link (web)") or None,
+                        pdf_path_cloud=row.get("PDF Path (cloud)") or None,
+                        pdf_r2_path=row.get("PDF R2 Path") or None,
+                    )
+                    count_new += 1
+            except Exception as e:
+                self.stdout.write(
+                    self.style.ERROR(f"❌ Error saving record: {e}")
                 )
-                count_new += 1
+                continue
 
             # Stop if limit is reached
             if limit and count_new >= limit:
                 break
 
+        # Final summary
+        self.stdout.write("\n" + "="*100)
         self.stdout.write(
             self.style.SUCCESS(
-                f"✅ {count_new} new records inserted, {count_existing} already existed (skipped)"
+                f"✅ SCRAPING COMPLETED!\n"
+                f"   📥 {count_new} new records inserted\n"
+                f"   🔄 {count_existing} duplicates skipped\n"
+                f"   📊 Total processed: {len(items)} records"
             )
         )
+        self.stdout.write("="*100)
