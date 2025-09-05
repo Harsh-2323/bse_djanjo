@@ -500,6 +500,248 @@ def scrape_bse_announcements_enhanced(
 
     return pd.DataFrame(records)
 
+from datetime import datetime
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from typing import List, Dict, Optional, Tuple
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import re
+import time
+import os
+import boto3
+from botocore.client import Config
+from django.core.management.base import BaseCommand
+from django.db import transaction
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium_scrape.models import SeleniumAnnouncement
+
+# Constants
+BSE_URL = "https://www.bseindia.com/corporates/ann.html"
+
+# Cloudflare R2 Configuration
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET")
+R2_PUBLIC_BASEURL = os.getenv("R2_PUBLIC_BASEURL")
+R2_BASE_PATH = "bse_announcements"
+
+# Enhanced Category Mapping (kept but NOT used anymore for extraction)
+CATEGORY_MAPPING = {
+    'agm': 'Annual General Meeting',
+    'annual general meeting': 'Annual General Meeting',
+    'egm': 'Extraordinary General Meeting',
+    'extraordinary general meeting': 'Extraordinary General Meeting',
+    'board meeting': 'Board Meeting',
+    'board': 'Board Meeting',
+    'dividend': 'Dividend',
+    'bonus': 'Bonus Issue',
+    'split': 'Stock Split',
+    'rights': 'Rights Issue',
+    'result': 'Financial Results',
+    'financial result': 'Financial Results',
+    'quarterly result': 'Financial Results',
+    'annual result': 'Financial Results',
+    'disclosure': 'Corporate Disclosure',
+    'intimation': 'Corporate Intimation',
+    'allotment': 'Share Allotment',
+    'newspaper': 'Newspaper Publication',
+    'advertisement': 'Advertisement',
+    'cessation': 'Management Changes',
+    'appointment': 'Management Changes',
+    'resignation': 'Management Changes',
+    'compliance': 'Regulatory Compliance',
+    'regulation 30': 'Regulatory Compliance',
+    'regulation 29': 'Regulatory Compliance',
+    'takeover': 'Takeover/Acquisition',
+    'acquisition': 'Takeover/Acquisition',
+    'merger': 'Merger',
+    'voting': 'Voting Results',
+    'scrutinizer': 'Voting Results',
+    'e-voting': 'E-Voting',
+    'share transfer': 'Share Transfer',
+    'register': 'Share Transfer',
+    'annual report': 'Annual Report',
+    'outcome': 'Meeting Outcome',
+    'closure': 'Book Closure',
+    'record date': 'Record Date'
+}
+
+def setup_driver(headless: bool = True):
+    """Setup Chrome driver with optimized options"""
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+        "plugins.always_open_pdf_externally": True,
+    }
+    opts.add_experimental_option("prefs", prefs)
+
+    return webdriver.Chrome(options=opts)
+
+def safe_filename(name: str, max_len: int = 150) -> str:
+    """Create safe filename from text"""
+    if not name:
+        return "announcement"
+    
+    # Clean the name
+    name = re.sub(r'[\\/*?:"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    
+    # Truncate if too long
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    
+    return name or "announcement"
+
+def clean_text(text: str) -> str:
+    """Clean and normalize text"""
+    if not text:
+        return ""
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Remove common artifacts
+    text = re.sub(r'Read less\.\.', '', text)
+    text = re.sub(r'\.{3,}', '...', text)  # Normalize ellipsis
+    
+    return text
+
+# NEW: Extract attachment size (only addition)
+def extract_attachment_size(table) -> str:
+    try:
+        text = table.get_text(" ", strip=True)
+        matches = re.findall(r'(\d+(?:\.\d{1,2})?)\s*(MB|KB)\b', text, flags=re.I)
+        if not matches:
+            return ""
+        sizes = [f"{val} {unit.upper()}" for (val, unit) in matches]
+        mb = next((s for s in sizes if s.endswith("MB")), None)
+        if mb:
+            return mb
+        kb = next((s for s in sizes if s.endswith("KB")), None)
+        return kb or ""
+    except Exception:
+        return ""
+
+def extract_company_details(newssub: str) -> Tuple[str, str]:
+    if not newssub:
+        return "", ""
+    
+    code_match = re.search(r'\b(\d{6})\b', newssub)
+    company_code = code_match.group(1) if code_match else ""
+    
+    if " - " in newssub:
+        company_name = newssub.split(" - ")[0].strip()
+    else:
+        company_name = re.sub(r'\s*-?\s*\d{6}\s*-?.*$', '', newssub).strip()
+    
+    return company_name, company_code
+
+def categorize_announcement(text: str) -> str:
+    if not text:
+        return "General"
+    
+    text_lower = text.lower()
+    
+    for keyword, category in CATEGORY_MAPPING.items():
+        if keyword in text_lower:
+            return category
+    
+    if re.search(r'\b(esop|employee stock option)\b', text_lower):
+        return "Employee Stock Options"
+    
+    if re.search(r'\b(debenture|bond|debt)\b', text_lower):
+        return "Debt Securities"
+    
+    if re.search(r'\b(credit rating|rating)\b', text_lower):
+        return "Credit Rating"
+    
+    return "General"
+
+def extract_announcement_data(table) -> Dict[str, str]:
+    data = {
+        'headline': '',
+        'announcement_text': '',
+        'category': '',
+        'company_name': '',
+        'company_code': '',
+        'attachment_size': ''
+    }
+    
+    try:
+        # 1. Extract NEWSSUB (Company info + HEADLINE now)
+        newssub_tag = table.find("span", {"ng-bind-html": "cann.NEWSSUB"})
+        newssub = newssub_tag.get_text(strip=True) if newssub_tag else ""  # ⚡ raw text, no cleaning
+        
+        if newssub:
+            data['company_name'], data['company_code'] = extract_company_details(newssub)
+            data['headline'] = newssub   # ⚡ directly use NEWSSUB as headline too
+        
+        # 2. Extract announcement content from UUID div
+        uuid_regex = re.compile(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$')
+        announcement_div = table.find("div", id=uuid_regex)
+        
+        if announcement_div:
+            announcement_content = clean_text(announcement_div.get_text(strip=True))
+            if announcement_content and announcement_content != data['headline']:
+                data['announcement_text'] = announcement_content
+            else:
+                data['announcement_text'] = data['headline']
+        else:
+            data['announcement_text'] = data['headline']
+        
+        # 3. Extract CATEGORY
+        try:
+            category_td = table.select_one("td.tdcolumngrey.ng-binding.ng-scope[ng-if*=\"cann.CATEGORYNAME\"]")
+            if category_td:
+                data['category'] = category_td.get_text(strip=True)
+            else:
+                data['category'] = ""
+        except Exception as e:
+            print(f"Error extracting category: {e}")
+            data['category'] = ""
+
+        # 4. Final cleanup
+        if data['headline'] and len(data['headline']) > 300:
+            data['headline'] = data['headline'][:297] + "..."
+        
+        if data['category'] and len(data['category']) > 100:
+            data['category'] = data['category'][:100]
+
+        try:
+            data['attachment_size'] = extract_attachment_size(table)
+        except Exception:
+            data['attachment_size'] = ""
+    
+    except Exception as e:
+        print(f"Error in extract_announcement_data: {e}")
+        if not data['announcement_text'] and not data['headline']:
+            data['announcement_text'] = "Error extracting announcement content"
+            data['headline'] = "Error extracting headline"
+            data['category'] = ""
+    
+    return data
+
+# (rest of the code remains UNCHANGED: upload_pdf_to_r2, scrape_bse_announcements_enhanced, Command class)
 class Command(BaseCommand):
     help = "Enhanced BSE Corporate Announcements Scraper with improved data quality"
 

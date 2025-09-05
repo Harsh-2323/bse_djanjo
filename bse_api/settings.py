@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     "rest_framework",
     "django_filters",
+    "django_apscheduler",
      "scrape",
      "selenium_scrape",
 ]
@@ -144,6 +145,41 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# ========================================
+# AUTOMATED SCRAPER CONFIGURATION
+# ========================================
+
+# Enable/disable automatic scraper startup when Django server starts
+AUTO_START_SCRAPERS = True  # Set to False to disable auto-start
+
+# Scraper intervals (in minutes)
+BSE_SCRAPER_INTERVAL_MINUTES = 30
+NSE_SCRAPER_INTERVAL_MINUTES = 30
+
+# Scraper behavior
+BSE_SCRAPER_STRATEGY = "TODAY_ONLY"  # Only scrape today's date
+NSE_FIRST_RUN_MAX_ROWS = 150  # Max rows to scrape on first NSE run
+NSE_REGULAR_RUN_MAX_ROWS = 100  # Max rows for subsequent NSE runs
+
+# Logging for scrapers
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'selenium_scrape.management.commands.start_auto_scrapers': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': True,
+        },
+    },
+}
 
 
 R2_ENDPOINT = os.getenv('R2_ENDPOINT')

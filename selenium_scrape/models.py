@@ -365,3 +365,76 @@ class NSECorporateAction(models.Model):
             sme_count = len(self.actions_data.get("sme", [])) if self.actions_data.get("sme") else 0
             self.total_actions_count = equity_count + sme_count
         super().save(*args, **kwargs)
+
+
+# selenium_scrape/models.py
+from django.db import models
+
+class NseAnnouncementAggregate(models.Model):
+    id = models.BigAutoField(primary_key=True)
+
+    # Company details
+    company_name = models.CharField(max_length=255, null=True, blank=True)
+    nse_code = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+
+    # Consolidated announcements data (normalized rows you’re producing)
+    announcements_data = models.JSONField(null=True, blank=True, help_text="JSON array of all announcements for this company")
+
+    # Date range for this scrape
+    scrape_start_date = models.CharField(max_length=20, null=True, blank=True, help_text="Start date in DD-MM-YYYY format")
+    scrape_end_date = models.CharField(max_length=20, null=True, blank=True, help_text="End date in DD-MM-YYYY format")
+
+    # PDF storage tracking (list of dicts with info per uploaded PDF)
+    pdfs_data = models.JSONField(null=True, blank=True, help_text="JSON array of PDF storage information")
+
+    # Metadata
+    total_announcements_count = models.IntegerField(default=0, help_text="Number of announcements in this record")
+    total_pdfs_count = models.IntegerField(default=0, help_text="Number of PDFs stored in cloud")
+    last_scraped = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "nse_announcement_aggregate"
+        indexes = [
+            models.Index(fields=["nse_code"]),
+        ]
+        unique_together = (("nse_code", "scrape_start_date", "scrape_end_date"),)
+
+    def __str__(self):
+        s = self.nse_code or "NSE"
+        return f"{s} [{self.scrape_start_date} → {self.scrape_end_date}]"
+
+
+# Scheduler Configuration Model
+class ScraperConfiguration(models.Model):
+    """Track scraping configuration and last run status"""
+    id = models.BigAutoField(primary_key=True)
+    
+    # Scraper identification
+    scraper_name = models.CharField(max_length=50, unique=True, help_text="Name of the scraper (e.g., 'bse_announcements', 'nse_announcements')")
+    
+    # Status tracking
+    is_first_run = models.BooleanField(default=True, help_text="True if this is the first time running the scraper")
+    last_scrape_date = models.CharField(max_length=20, null=True, blank=True, help_text="Last date scraped in DD-MM-YYYY format")
+    last_run_timestamp = models.DateTimeField(null=True, blank=True, help_text="When the scraper was last executed")
+    
+    # Configuration
+    is_enabled = models.BooleanField(default=True, help_text="Whether this scraper is enabled")
+    scrape_interval_minutes = models.IntegerField(default=30, help_text="How often to run the scraper (in minutes)")
+    
+    # Status and metadata
+    last_records_processed = models.IntegerField(default=0, help_text="Number of records processed in last run")
+    last_new_records = models.IntegerField(default=0, help_text="Number of new records added in last run")
+    last_error_message = models.TextField(null=True, blank=True, help_text="Last error message if any")
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "scraper_configurations"
+        ordering = ["scraper_name"]
+    
+    def __str__(self):
+        status = "First Run" if self.is_first_run else f"Last: {self.last_scrape_date or 'Never'}"
+        return f"{self.scraper_name} - {status}"
