@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Quotes Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --primary: #6366f1;
+      --primary-dark: #4f46e5;
+      --primary-light: #a5b4fc;
+      --secondary: #8b5cf6;
+      --accent: #06b6d4;
+      --success: #10b981;
+      --error: #ef4444;
+      --warning: #f59e0b;
+      --info: #3b82f6;
+      --background: #0f0f23;
+      --background-secondary: #1a1a3a;
+      --card-bg: rgba(255, 255, 255, 0.05);
+      --card-border: rgba(255, 255, 255, 0.1);
+      --text-primary: #ffffff;
+      --text-secondary: #a1a1aa;
+      --text-muted: #71717a;
+      --glass-bg: rgba(255, 255, 255, 0.08);
+      --glass-border: rgba(255, 255, 255, 0.2);
+      --shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      --shadow-hover: 0 12px 40px rgba(0, 0, 0, 0.4);
+      --border-radius: 16px;
+      --border-radius-sm: 8px;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: var(--text-primary);
+      min-height: 100vh;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--border-radius);
+      padding: 1.5rem;
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow);
+      transition: all 0.3s ease;
+    }
+
+    .card:hover {
+      box-shadow: var(--shadow-hover);
+      transform: translateY(-2px);
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+    }
+
+    .header h1 {
+      font-size: 2rem;
+      font-weight: 600;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .stat-card {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--border-radius-sm);
+      padding: 1rem;
+      text-align: center;
+    }
+
+    .stat-card h3 {
+      font-size: 1rem;
+      color: var(--text-secondary);
+      margin-bottom: 0.5rem;
+    }
+
+    .stat-card p {
+      font-size: 1.5rem;
+      font-weight: 600;
+    }
+
+    .input-group {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      margin-bottom: 2rem;
+    }
+
+    .file-input-wrapper {
+      position: relative;
+      flex: 1;
+    }
+
+    input[type="file"] {
+      display: none;
+    }
+
+    .file-label {
+      display: block;
+      padding: 0.75rem 1rem;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--border-radius-sm);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      color: var(--text-secondary);
+      text-align: center;
+    }
+
+    .file-label:hover {
+      background: var(--primary-light);
+      color: var(--text-primary);
+    }
+
+    button {
+      padding: 0.75rem 1.5rem;
+      background: var(--primary);
+      color: white;
+      border: none;
+      border-radius: var(--border-radius-sm);
+      cursor: pointer;
+      font-weight: 500;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    button:hover {
+      background: var(--primary-dark);
+    }
+
+    button:disabled {
+      background: var(--text-muted);
+      cursor: not-allowed;
+    }
+
+    .table-container {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--card-bg);
+      border-radius: var(--border-radius-sm);
+      overflow: hidden;
+    }
+
+    th, td {
+      padding: 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    th {
+      background: var(--glass-bg);
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .badge {
+      padding: 0.25rem 0.5rem;
+      border-radius: 12px;
+      font-size: 0.875rem;
+    }
+
+    .badge-info {
+      background: var(--info);
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 2rem;
+      color: var(--text-secondary);
+    }
+
+    .empty-state-icon {
+      font-size: 2rem;
+      margin-bottom: 1rem;
+    }
+
+    .status-message {
+      padding: 1rem;
+      border-radius: var(--border-radius-sm);
+      margin-bottom: 1rem;
+      display: none;
+    }
+
+    .status-message.success {
+      background: var(--success);
+    }
+
+    .status-message.error {
+      background: var(--error);
+    }
+
+    .progress-section {
+      display: none;
+      margin-bottom: 2rem;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: var(--card-border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--success);
+      transition: width 0.3s ease;
+    }
+
+    .log-box {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--border-radius-sm);
+      padding: 1rem;
+      max-height: 200px;
+      overflow-y: auto;
+      color: var(--text-secondary);
+      font-family: monospace;
+      margin-bottom: 2rem;
+      display: none;
+    }
+
+    .fade-in {
+      animation: fadeIn 0.5s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      padding: 1rem 1.5rem;
+      border-radius: var(--border-radius-sm);
+      color: white;
+      display: none;
+      z-index: 1000;
+      max-width: 400px;
+    }
+
+    .toast.success { background: var(--success); }
+    .toast.error { background: var(--error); }
+    .toast.info { background: var(--info); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Stock Quotes Dashboard</h1>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <h3>Total Quotes</h3>
+        <p id="totalQuotes">0</p>
+      </div>
+      <div class="stat-card">
+        <h3>Total Files</h3>
+        <p id="totalFiles">0</p>
+      </div>
+      <div class="stat-card">
+        <h3>Success Rate</h3>
+        <p id="successRate">0%</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="input-group">
+        <div class="file-input-wrapper">
+          <input type="file" id="excelFile" accept=".xlsx, .xls">
+          <label for="excelFile" class="file-label" id="fileLabel">Choose Excel File with CD_BSE Code</label>
+        </div>
+        <button id="scrapeQuotesBtn" onclick="runQuotesScraper()">
+          <span id="quotesIcon">📈</span>
+          <span id="quotesText">Process Stock Quotes</span>
+        </button>
+        <button id="cancelBtn" onclick="cancelProcessing()" style="display: none; background: var(--error);">
+          <span>❌</span>
+          <span>Cancel</span>
+        </button>
+      </div>
+      <div id="quoteStatus" class="status-message"></div>
+
+      <div class="progress-section" id="quoteResults">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+          <span>Progress: <span id="progressPercent">0%</span></span>
+          <span>Processed: <span id="processedCount">0</span>/<span id="totalCount">0</span></span>
+          <span>Successful: <span id="successfulCount">0</span></span>
+          <span>Errors: <span id="errorCount">0</span></span>
+          <span>Skipped: <span id="skippedCount">0</span></span>
+          <span>Time Remaining: <span id="timeRemaining">0s</span></span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill" style="width: 0%;"></div>
+        </div>
+      </div>
+
+      <div class="log-box" id="logSection"></div>
+
+      <div class="table-container" id="quotesData" style="display: none;">
+        <table id="quotesTable">
+          <thead>
+            <tr>
+              <th>Scrip Code</th>
+              <th>Company Name</th>
+              <th>Security Name</th>
+              <th>Basic Industry</th>
+              <th>Scraped At</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const currentStats = {
+      quotes: 0,
+      totalFiles: 0,
+      successRate: 0
+    };
+
+    const progressState = {
+      total: 0,
+      processed: 0,
+      successful: 0,
+      errors: 0,
+      skipped: 0,
+      startTime: 0,
+      timePerCode: [],
+      isProcessing: false
+    };
+
+    let progressUpdateInterval = null;
+
+    function getCsrfToken() {
+      const name = 'csrftoken';
+      let cookieValue = null;
+      if (document.cookie && document.cookie !== '') {
+        const cookies = document.cookie.split(';');
+        for (let i = 0; i < cookies.length; i++) {
+          const cookie = cookies[i].trim();
+          if (cookie.substring(0, name.length + 1) === (name + '=')) {
+            cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+            break;
+          }
+        }
+      }
+      return cookieValue;
+    }
+
+    function showToast(message, type) {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.className = `toast ${type}`;
+      toast.style.display = 'block';
+      setTimeout(() => {
+        toast.style.display = 'none';
+      }, 3000);
+    }
+
+    function updateStats() {
+      document.getElementById('totalQuotes').textContent = currentStats.quotes;
+      document.getElementById('totalFiles').textContent = currentStats.totalFiles;
+      document.getElementById('successRate').textContent = `${currentStats.successRate}%`;
+    }
+
+    function setButtonLoading(buttonId, iconId, textId, isLoading, loadingText = '') {
+      const button = document.getElementById(buttonId);
+      const icon = document.getElementById(iconId);
+      const text = document.getElementById(textId);
+      button.disabled = isLoading;
+      icon.textContent = isLoading ? '⏳' : '📈';
+      text.textContent = isLoading ? loadingText : 'Process Stock Quotes';
+    }
+
+    function showProgressSection(show) {
+      document.getElementById('quoteResults').style.display = show ? 'block' : 'none';
+    }
+
+    function resetProgressState() {
+      progressState.total = 0;
+      progressState.processed = 0;
+      progressState.successful = 0;
+      progressState.errors = 0;
+      progressState.skipped = 0;
+      progressState.startTime = 0;
+      progressState.timePerCode = [];
+      progressState.isProcessing = false;
+      updateProgressStats();
+      showProgressSection(false);
+      document.getElementById('logSection').style.display = 'none';
+      document.getElementById('logSection').innerHTML = '';
+    }
+
+    function updateProgressStats() {
+      const percent = progressState.total > 0 ? Math.round((progressState.processed / progressState.total) * 100) : 0;
+      document.getElementById('progressPercent').textContent = `${percent}%`;
+      document.getElementById('processedCount').textContent = progressState.processed;
+      document.getElementById('totalCount').textContent = progressState.total;
+      document.getElementById('successfulCount').textContent = progressState.successful;
+      document.getElementById('errorCount').textContent = progressState.errors;
+      document.getElementById('skippedCount').textContent = progressState.skipped;
+      document.getElementById('progressFill').style.width = `${percent}%`;
+
+      if (progressState.processed < progressState.total) {
+        const avgTime = progressState.timePerCode.length > 0 
+          ? progressState.timePerCode.reduce((a, b) => a + b, 0) / progressState.timePerCode.length 
+          : 3000;
+        const remainingCodes = progressState.total - progressState.processed;
+        const timeRemaining = Math.round((remainingCodes * avgTime) / 1000);
+        document.getElementById('timeRemaining').textContent = `${timeRemaining}s`;
+      } else {
+        document.getElementById('timeRemaining').textContent = '0s';
+      }
+    }
+
+    function updateLogBox(message) {
+      const logBox = document.getElementById('logSection');
+      const logEntry = document.createElement('div');
+      logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      logBox.appendChild(logEntry);
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function addResultRow(result) {
+      const tbody = document.querySelector("#quotesTable tbody");
+      const tr = document.createElement("tr");
+      tr.style.animationDelay = `${tbody.children.length * 0.1}s`;
+      tr.className = 'fade-in';
+      const statusClass = result.status === 'success' ? 'badge-info' : 
+                        result.status === 'error' ? 'badge-error' : 'badge-warning';
+      tr.innerHTML = `
+        <td><strong>${result.scripcode || "N/A"}</strong></td>
+        <td>${result.message.includes('Successfully scraped') ? result.message.split(': ')[1] || "N/A" : "N/A"}</td>
+        <td><span class="badge ${statusClass}">${result.status || "N/A"}</span></td>
+        <td>${result.message || "N/A"}</td>
+        <td>${new Date().toLocaleString()}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    async function cancelProcessing() {
+      // Note: Backend cancellation not implemented; this clears frontend state
+      resetProgressState();
+      document.getElementById('cancelBtn').style.display = 'none';
+      showToast('Processing cancelled', 'info');
+      setButtonLoading('scrapeQuotesBtn', 'quotesIcon', 'quotesText', false);
+      document.getElementById('excelFile').value = '';
+      document.getElementById('fileLabel').textContent = 'Choose Excel File with CD_BSE Code';
+    }
+
+    document.getElementById('excelFile').addEventListener('change', (e) => {
+      const fileLabel = document.getElementById('fileLabel');
+      fileLabel.textContent = e.target.files.length ? e.target.files[0].name : 'Choose Excel File with CD_BSE Code';
+    });
+
+    async function fetchQuotesData() {
+      try {
+        const response = await fetch('/api/selenium_scrape/bse_stock_quotes/');
+        if (!response.ok) {
+          if (response.status === 404) {
+            throw new Error('Stock quotes endpoint not found. Ensure backend is running at /api/selenium_scrape/bse_stock_quotes/.');
+          }
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const quotes = await response.json();
+
+        const tbody = document.querySelector("#quotesDataTable tbody");
+        tbody.innerHTML = "";
+
+        if (quotes.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="5" class="empty-state">
+                <div class="empty-state-icon">📈</div>
+                <p>No stock quotes available. Upload an Excel file with CD_BSE Code column to start scraping.</p>
+              </td>
+            </tr>`;
+        } else {
+          quotes.forEach((q, index) => {
+            const tr = document.createElement("tr");
+            tr.style.animationDelay = `${index * 0.1}s`;
+            tr.className = 'fade-in';
+            tr.innerHTML = `
+              <td><strong>${q.scripcode || "N/A"}</strong></td>
+              <td>${q.company_name || "N/A"}</td>
+              <td><span class="badge badge-info">${q.security_name || "N/A"}</span></td>
+              <td>${q.basic_industry || "N/A"}</td>
+              <td>${q.scraped_at ? new Date(q.scraped_at).toLocaleString() : "N/A"}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+        document.getElementById("quotesData").style.display = "block";
+      } catch (error) {
+        console.error('Error fetching quotes data:', error);
+        showToast(`Failed to load stock quotes: ${error.message}`, 'error');
+      }
+    }
+
+    async function runQuotesScraper() {
+      const fileInput = document.getElementById("excelFile");
+      const statusDiv = document.getElementById("quoteStatus");
+
+      if (!fileInput.files.length) {
+        statusDiv.innerText = "⚠️ Please select an Excel file with CD_BSE Code column before proceeding.";
+        statusDiv.className = "status-message error";
+        statusDiv.style.display = "block";
+        showToast("No file selected", "error");
+        return;
+      }
+
+      setButtonLoading('scrapeQuotesBtn', 'quotesIcon', 'quotesText', true, 'Uploading Excel File...');
+      statusDiv.style.display = "none";
+      resetProgressState();
+
+      try {
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        updateLogBox("📤 Uploading Excel file to server...");
+        const response = await fetch('/api/selenium_scrape/bse_stock_quotes/scrape_quotes_from_excel/', {
+          method: 'POST',
+          body: formData,
+          headers: {
+            'X-CSRFToken': getCsrfToken(),
+          },
+        });
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            throw new Error('Excel scraping endpoint not found. Ensure backend is running at /api/selenium_scrape/bse_stock_quotes/scrape_quotes_from_excel/.');
+          }
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (data.status !== 'error') {
+          updateLogBox(`📋 Found ${data.summary.valid_codes} BSE codes in Excel file`);
+          showToast(`📋 Found ${data.summary.valid_codes} BSE codes. Processing completed.`, 'info');
+
+          // Initialize progress state
+          progressState.total = data.summary.valid_codes;
+          progressState.processed = 0;
+          progressState.successful = data.summary.successful;
+          progressState.errors = data.summary.errors;
+          progressState.skipped = data.summary.skipped;
+          progressState.startTime = Date.now();
+          progressState.isProcessing = true;
+
+          showProgressSection(true);
+          document.getElementById('quoteResults').style.display = 'block';
+          document.getElementById('logSection').style.display = 'block';
+          document.getElementById('cancelBtn').style.display = 'block';
+          document.querySelector("#quotesTable tbody").innerHTML = "";
+
+          // Update results table with backend data
+          data.results.forEach((result, index) => {
+            addResultRow(result);
+            updateLogBox(`[${result.status.toUpperCase()}] ${result.scripcode}: ${result.message}`);
+            if (result.status === 'success') progressState.successful++;
+            else if (result.status === 'error' || result.status === 'timeout' || result.status === 'exception') progressState.errors++;
+            else if (result.status === 'skipped') progressState.skipped++;
+            progressState.processed++;
+            progressState.timePerCode.push(3000); // Approximate time per code (3s delay in backend)
+            if (progressState.timePerCode.length > 10) progressState.timePerCode.shift();
+          });
+
+          updateProgressStats();
+
+          // Update stats
+          currentStats.quotes = progressState.processed;
+          currentStats.totalFiles += 1;
+          currentStats.successRate = progressState.total > 0 ? 
+            Math.round((progressState.successful / progressState.total) * 100) : 0;
+          updateStats();
+
+          showToast(`🎉 Processing completed! ${progressState.successful}/${progressState.total} codes processed successfully`, 'success');
+          await fetchQuotesData(); // Refresh quotes table
+        } else {
+          throw new Error(data.message || 'Failed to process Excel file');
+        }
+      } catch (error) {
+        console.error('Error processing quotes:', error);
+        statusDiv.style.display = "block";
+        statusDiv.className = "status-message error";
+        statusDiv.innerHTML = `
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span>❌</span>
+            <span>Error: ${error.message}</span>
+          </div>
+        `;
+        updateLogBox(`❌ CRITICAL ERROR: ${error.message}`);
+        showToast(`❌ Quote processing failed: ${error.message}`, 'error');
+        resetProgressState();
+        showProgressSection(false);
+      } finally {
+        setButtonLoading('scrapeQuotesBtn', 'quotesIcon', 'quotesText', false);
+        fileInput.value = "";
+        document.getElementById('fileLabel').textContent = 'Choose Excel File with CD_BSE Code';
+        document.getElementById('cancelBtn').style.display = 'none';
+        progressState.isProcessing = false;
+        if (progressUpdateInterval) {
+          clearInterval(progressUpdateInterval);
+          progressUpdateInterval = null;
+        }
+      }
+    }
+
+    // Initialize
+    fetchQuotesData();
+  </script>
+</body>
+</html>
